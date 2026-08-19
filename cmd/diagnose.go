@@ -10,7 +10,11 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/couchbaselabs/gocbconnstr"
@@ -218,7 +222,12 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 		Timeout:   2000 * time.Millisecond,
 	}
 
-	uri := fmt.Sprintf("http://%s:%d/pools/default/b/%s", host, port, bucket)
+	scheme := "http"
+	if tlsConfig != nil {
+		scheme = "https"
+	}
+
+	uri := fmt.Sprintf("%s://%s:%d/pools/default/b/%s", scheme, host, port, bucket)
 	req, _ := http.NewRequest("GET", uri, nil)
 	req.SetBasicAuth(user, pass)
 
@@ -279,6 +288,158 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 	config.SourceHost = host
 
 	return config, nil
+}
+
+type portDef struct {
+	Port int
+	Name string
+}
+
+var couchbasePorts = []portDef{
+	{8091, "mgmt"}, {8092, "views"}, {8093, "query"}, {8094, "search"},
+	{8095, "analytics"}, {8096, "eventing"}, {8097, "backup"}, {11210, "kv"},
+	{18091, "mgmtSSL"}, {18092, "viewsSSL"}, {18093, "querySSL"}, {18094, "searchSSL"},
+	{18095, "analyticsSSL"}, {18096, "eventingSSL"}, {18097, "backupSSL"}, {11207, "kvSSL"},
+}
+
+func matrixPorts(nodes []clusterNode) []portDef {
+	names := map[int]string{}
+	for _, p := range couchbasePorts {
+		names[p.Port] = p.Name
+	}
+
+	for _, node := range nodes {
+		for name, port := range node.Services {
+			if port != 0 {
+				names[port] = name
+			}
+		}
+	}
+
+	ports := make([]portDef, 0, len(names))
+	for port, name := range names {
+		ports = append(ports, portDef{port, name})
+	}
+	sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
+
+	return ports
+}
+
+// Windows reports refusals as WSAECONNREFUSED, which does not match syscall.ECONNREFUSED.
+const wsaeConnRefused = syscall.Errno(10061)
+
+func probePort(host string, port int, timeout time.Duration) string {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
+	if err == nil {
+		conn.Close()
+		return "open"
+	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) && (errno == syscall.ECONNREFUSED || errno == wsaeConnRefused) {
+		return "refused"
+	}
+
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return "filtered"
+	}
+
+	return "error"
+}
+
+func scanPortMatrix(nodes []clusterNode) {
+	ports := matrixPorts(nodes)
+
+	gLog.Log("Scanning %d Couchbase ports across all %d node(s)", len(ports), len(nodes))
+
+	sem := make(chan struct{}, 32)
+	var wg sync.WaitGroup
+
+	results := make([][]string, len(nodes))
+	for i := range nodes {
+		results[i] = make([]string, len(ports))
+
+		for j := range ports {
+			wg.Add(1)
+
+			go func(i, j int) {
+				defer wg.Done()
+
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				results[i][j] = probePort(nodes[i].Hostname, ports[j].Port,
+					2000*time.Millisecond)
+			}(i, j)
+		}
+	}
+	wg.Wait()
+
+	nameWidth := len("PORT MATRIX")
+	for _, node := range nodes {
+		if len(node.Hostname) > nameWidth {
+			nameWidth = len(node.Hostname)
+		}
+	}
+
+	const portsPerRow = 8
+	for start := 0; start < len(ports); start += portsPerRow {
+		end := start + portsPerRow
+		if end > len(ports) {
+			end = len(ports)
+		}
+
+		header := fmt.Sprintf("%-*s", nameWidth, "PORT MATRIX")
+		for _, p := range ports[start:end] {
+			header += fmt.Sprintf(" %8d", p.Port)
+		}
+		gLog.Log("%s", header)
+
+		for i, node := range nodes {
+			row := fmt.Sprintf("%-*s", nameWidth, node.Hostname)
+			for j := start; j < end; j++ {
+				row += fmt.Sprintf(" %8s", results[i][j])
+			}
+			gLog.Log("%s", row)
+		}
+	}
+
+	for j, p := range ports {
+		var filtered, refused, open []string
+
+		for i, node := range nodes {
+			switch results[i][j] {
+			case "filtered":
+				filtered = append(filtered, node.Hostname)
+			case "refused":
+				refused = append(refused, node.Hostname)
+			case "open":
+				open = append(open, node.Hostname)
+			}
+		}
+
+		if len(filtered) == len(nodes) {
+			gLog.Error(
+				"Port %d (%s) is filtered on all %d node(s).  Packets are being dropped rather"+
+					" than refused, and the behaviour is consistent across nodes, which indicates"+
+					" a firewall rule rather than a stopped service.",
+				p.Port, p.Name, len(nodes))
+		} else if len(filtered) > 0 {
+			gLog.Warn(
+				"Port %d (%s) is filtered on `%s` but not on every node.  Packets are being"+
+					" dropped on those hosts specifically, which indicates a per-host firewall"+
+					" rule rather than a cluster-wide one.",
+				p.Port, p.Name, strings.Join(filtered, ", "))
+		}
+
+		if len(refused) > 0 && len(open) > 0 {
+			gLog.Warn(
+				"Port %d (%s) is refused on `%s` but open on %d other node(s).  Nothing is"+
+					" listening there, which indicates the service is down on those nodes rather"+
+					" than a network problem.",
+				p.Port, p.Name, strings.Join(refused, ", "), len(open))
+		}
+	}
 }
 
 func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
@@ -411,7 +572,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			} else {
 				gLog.Error(
 					"Failed to perform DNS lookup for bootstrap entry `%s` (error: %s)",
-					err)
+					strippedHost, err)
 				continue
 			}
 		}
@@ -487,6 +648,10 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			}
 
 			thisNodeExt := config.GetSourceNodeExt()
+			if thisNodeExt == nil {
+				continue
+			}
+
 			if thisNodeExt.Hostname != "" && target.Host != thisNodeExt.Hostname {
 				gLog.Warn(
 					"Bootstrap host `%s` is not using the canonical node hostname of `%s`.  This"+
@@ -676,6 +841,23 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			} else if resp.StatusCode != 200 {
 				gLog.Log("Failed to retreive cluster information (status code: %d)", resp.StatusCode)
 			} else {
+				if serverTime, dateErr := http.ParseTime(resp.Header.Get("Date")); dateErr == nil {
+					skew := time.Since(serverTime)
+
+					direction := "ahead of"
+					if skew < 0 {
+						skew = -skew
+						direction = "behind"
+					}
+
+					if skew >= 30*time.Second {
+						gLog.Error(
+							"Local clock is %s %s node `%s`.  Clock skew breaks certificate"+
+								" validation and makes correlating client and cluster logs unreliable.",
+							skew.Round(time.Second), direction, infoSourceHost)
+					}
+				}
+
 				var clusterConfig map[string]interface{}
 				json.NewDecoder(resp.Body).Decode(&clusterConfig)
 
@@ -686,8 +868,14 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	}
 
 	//======================================================================
+	//  PORT MATRIX
+	//======================================================================
+	scanPortMatrix(nodesList)
+
+	//======================================================================
 	//  SERVICES
 	//======================================================================
+	var svcOk, svcFailed int
 
 	testHTTPTransport := &http.Transport{
 		TLSClientConfig: tlsConfig,
@@ -708,9 +896,11 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			client, err := helpers.Dial(node.Hostname, svcPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
+				svcFailed++
 				gLog.Error("Failed to connect to %s service at `%s:%d` (error: %s)",
 					svcName, node.Hostname, node.Services[svcKey], err.Error())
 			} else {
+				svcOk++
 				gLog.Log("Successfully connected to %s service at `%s:%d`",
 					svcName, node.Hostname, node.Services[svcKey])
 
@@ -738,9 +928,11 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 			_, err := testHTTPClient.Do(req)
 			if err != nil {
+				svcFailed++
 				gLog.Error("Failed to connect to %s service at `%s:%d` (error: %s)",
 					svcName, node.Hostname, node.Services[svcKey], err.Error())
 			} else {
+				svcOk++
 				gLog.Log("Successfully connected to %s service at `%s:%d`",
 					svcName, node.Hostname, node.Services[svcKey])
 			}
@@ -758,6 +950,16 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		testHTTPService(node, "Analytics", "cbas", "cbasSSL")
 	}
 
+	if svcOk == 0 && svcFailed > 0 {
+		gLog.Error(
+			"Bootstrap succeeded but every one of the %d advertised service endpoints was"+
+				" unreachable.  This is the signature of a client sitting outside the cluster's"+
+				" network: the nodes are advertising hostnames on the `%s` network that do not"+
+				" resolve or route from here.  Configure alternate addresses on the cluster so"+
+				" it advertises externally reachable hostnames to clients like this one.",
+			svcFailed, selectedNetwork)
+	}
+
 	//======================================================================
 	//  CONNECTION PERFORMANCE
 	//======================================================================
@@ -772,7 +974,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
 				gLog.Warn(
-					"Failed to perform KV connection performance analysis on `%s:%d` (error: %d)",
+					"Failed to perform KV connection performance analysis on `%s:%d` (error: %s)",
 					node.Hostname, kvPort, err.Error())
 				continue
 			}
