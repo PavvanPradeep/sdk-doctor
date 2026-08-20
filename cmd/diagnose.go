@@ -29,6 +29,37 @@ func stripIPv6Address(address string) string {
 	return address
 }
 
+const certExpiryWarnDays = 30
+
+func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
+	if len(info.Chain) == 0 {
+		return
+	}
+
+	leaf := info.Chain[0]
+
+	gLog.Log(
+		"TLS on `%s:%d`: %s, %s, subject `%s`",
+		host, port, info.VersionName, info.CipherName, leaf.Subject)
+
+	if leaf.DaysToExpiry < 0 {
+		gLog.Warn(
+			"Certificate for `%s:%d` expired %d days ago (%s).",
+			host, port, -leaf.DaysToExpiry, leaf.NotAfter.Format("2006-01-02"))
+	} else if leaf.DaysToExpiry <= certExpiryWarnDays {
+		gLog.Warn(
+			"Certificate for `%s:%d` expires in %d days (%s).",
+			host, port, leaf.DaysToExpiry, leaf.NotAfter.Format("2006-01-02"))
+	}
+
+	if !info.HostMatches {
+		gLog.Error(
+			"Dialed hostname `%s` is not present in the certificate's subject alternative"+
+				" names %v for `%s:%d`.",
+			info.DialedHost, info.LeafSANs, host, port)
+	}
+}
+
 // diagnoseCmd represents the diagnose command
 var diagnoseCmd = &cobra.Command{
 	Use:   "diagnose [connection_string]",
@@ -977,6 +1008,41 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 					"Failed to perform KV connection performance analysis on `%s:%d` (error: %s)",
 					node.Hostname, kvPort, err.Error())
 				continue
+			}
+
+			timing := client.Timing()
+
+			tlsPhase := "-"
+			if tlsConfig != nil {
+				tlsPhase = fmt.Sprintf("%dms", timing.TLS()/time.Millisecond)
+			}
+
+			gLog.Log(
+				"Connect phases for `%s:%d`: dns %dms, tcp %dms, tls %s, sasl %dms",
+				node.Hostname, kvPort,
+				timing.DNS()/time.Millisecond,
+				timing.TCP()/time.Millisecond,
+				tlsPhase,
+				client.SASLDuration()/time.Millisecond)
+
+			if timing.TCP() > 20*time.Millisecond && timing.TCP() > 5*timing.DNS() {
+				gLog.Warn(
+					"TCP handshake to `%s:%d` took %dms against %dms for DNS resolution --"+
+						" latency appears to be on the network path, not name resolution.",
+					node.Hostname, kvPort,
+					timing.TCP()/time.Millisecond, timing.DNS()/time.Millisecond)
+			}
+
+			firstOpStart := time.Now()
+			firstOpErr := client.Ping()
+			firstOpDuration := time.Since(firstOpStart)
+			gLog.Log(
+				"First operation on `%s:%d` completed in %dms (error: %v)",
+				node.Hostname, kvPort, firstOpDuration/time.Millisecond, firstOpErr)
+
+			if tlsConfig != nil && client.TLSState() != nil {
+				tlsInfo := helpers.BuildTLSChainInfo(client.TLSState(), node.Hostname, time.Now())
+				logTLSChainInfo(node.Hostname, kvPort, tlsInfo)
 			}
 
 			var stats helpers.PingHelper

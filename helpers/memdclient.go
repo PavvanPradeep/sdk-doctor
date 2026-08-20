@@ -12,7 +12,10 @@ import (
 
 // MemdClient provides a memcached client
 type MemdClient struct {
-	conn memd.ReadWriteCloser
+	conn         memd.ReadWriteCloser
+	timing       memd.ConnectTiming
+	tlsState     *tls.ConnectionState
+	saslDuration time.Duration
 }
 
 // Dial will dial a particular host and return a MemdClient
@@ -31,15 +34,19 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 		srvTLSConfig.ServerName = host
 	}
 
-	conn, err := memd.DialMemdConn(address, srvTLSConfig, deadline)
+	dialResult, err := memd.DialMemdConn(address, srvTLSConfig, deadline)
 	if err != nil {
 		return nil, err
 	}
 
 	var client MemdClient
-	client.conn = conn
+	client.conn = dialResult.Conn
+	client.timing = dialResult.Timing
+	client.tlsState = dialResult.TLSState
 
+	saslStart := time.Now()
 	err = client.auth(user, pass)
+	client.saslDuration = time.Since(saslStart)
 	if err != nil {
 		client.Close()
 		return nil, err
@@ -59,6 +66,22 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 // Close closes a connection
 func (client *MemdClient) Close() {
 	client.conn.Close()
+}
+
+// Timing returns the per-phase timing gathered while dialing this connection.
+func (client *MemdClient) Timing() memd.ConnectTiming {
+	return client.timing
+}
+
+// TLSState returns the negotiated TLS connection state, or nil if this
+// connection is not using TLS.
+func (client *MemdClient) TLSState() *tls.ConnectionState {
+	return client.tlsState
+}
+
+// SASLDuration returns how long SASL authentication took.
+func (client *MemdClient) SASLDuration() time.Duration {
+	return client.saslDuration
 }
 
 func (client *MemdClient) auth(user, pass string) error {
