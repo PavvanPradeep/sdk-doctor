@@ -42,8 +42,9 @@ func TestDialMemdConnTimingNoTLS(t *testing.T) {
 	}
 	defer result.Conn.Close()
 
-	if result.Timing.DNS() < 0 {
-		t.Errorf("expected non-negative DNS duration, got %s", result.Timing.DNS())
+	// Dialing an IP literal performs no lookup, so the phase must stay unstamped rather than report 0s
+	if !result.Timing.DNSStart.IsZero() {
+		t.Errorf("expected no DNS phase for an IP literal, got %s", result.Timing.DNSStart)
 	}
 	if result.Timing.TCPDone.Before(result.Timing.TCPStart) {
 		t.Errorf("TCPDone (%s) is before TCPStart (%s)", result.Timing.TCPDone, result.Timing.TCPStart)
@@ -53,6 +54,32 @@ func TestDialMemdConnTimingNoTLS(t *testing.T) {
 	}
 	if result.TLSState != nil {
 		t.Errorf("expected nil TLSState for a non-TLS dial, got %+v", result.TLSState)
+	}
+}
+
+func TestReadDeadlineBoundsAStalledPeer(t *testing.T) {
+	addr, closeFn := startEchoListener(t)
+	defer closeFn()
+
+	result, err := DialMemdConn(addr, nil, time.Now().Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("DialMemdConn failed: %s", err)
+	}
+	defer result.Conn.Close()
+
+	if err := result.Conn.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetDeadline failed: %s", err)
+	}
+
+	// The listener never replies, so without a deadline this read would block forever
+	var resp Response
+	start := time.Now()
+	if err := result.Conn.ReadPacket(&resp); err == nil {
+		t.Fatal("expected the read to time out")
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("read took %s, the deadline was not applied", elapsed)
 	}
 }
 

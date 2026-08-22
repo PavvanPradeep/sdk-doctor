@@ -45,6 +45,7 @@ type Dialer interface {
 type ReadWriteCloser interface {
 	WritePacket(*Request) error
 	ReadPacket(*Response) error
+	SetDeadline(time.Time) error
 	Close() error
 }
 
@@ -104,14 +105,19 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		resolveCtx = ctx
 	}
 
-	timing.DNSStart = time.Now()
-	ips, err := net.DefaultResolver.LookupHost(resolveCtx, host)
-	timing.DNSDone = time.Now()
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no addresses found for host `%s`", host)
+	// An IP literal is never resolved, so stamping the DNS phase would report a lookup that never happened
+	ips := []string{host}
+	if net.ParseIP(host) == nil {
+		timing.DNSStart = time.Now()
+		ips, err = net.DefaultResolver.LookupHost(resolveCtx, host)
+		timing.DNSDone = time.Now()
+		if err != nil {
+			return nil, err
+		}
+
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no addresses found for host `%s`", host)
+		}
 	}
 
 	d := net.Dialer{
@@ -136,6 +142,9 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 	tcpConn := baseConn.(*net.TCPConn)
 	tcpConn.SetNoDelay(false)
 
+	// The dialer deadline does not cover the handshake, and a peer that accepts then stalls would hang forever
+	tcpConn.SetDeadline(deadline)
+
 	var conn io.ReadWriteCloser
 	var tlsState *tls.ConnectionState
 	if tlsConfig == nil {
@@ -147,6 +156,7 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		err = tlsConn.Handshake()
 		timing.TLSDone = time.Now()
 		if err != nil {
+			tcpConn.Close()
 			return nil, err
 		}
 
@@ -167,6 +177,16 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 
 func (s *memdConn) Close() error {
 	return s.conn.Close()
+}
+
+// SetDeadline bounds every subsequent read and write, or clears the bound with a zero time
+func (s *memdConn) SetDeadline(t time.Time) error {
+	conn, ok := s.conn.(net.Conn)
+	if !ok {
+		return nil
+	}
+
+	return conn.SetDeadline(t)
 }
 
 func (s *memdConn) WritePacket(req *Request) error {

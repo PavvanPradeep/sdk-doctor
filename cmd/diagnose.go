@@ -43,20 +43,23 @@ func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
 		return
 	}
 
-	leaf := info.Chain[0]
+	gLog.Log("TLS on `%s:%d`: %s, %s, chain of %d certificate(s):",
+		host, port, info.VersionName, info.CipherName, len(info.Chain))
 
-	gLog.Log(
-		"TLS on `%s:%d`: %s, %s, subject `%s`",
-		host, port, info.VersionName, info.CipherName, leaf.Subject)
+	for i, cert := range info.Chain {
+		gLog.Log("  [%d] subject `%s`, issuer `%s`, expires %s",
+			i, cert.Subject, cert.Issuer, cert.NotAfter.Format("2006-01-02"))
 
-	if leaf.DaysToExpiry < 0 {
-		gLog.Warn(
-			"Certificate for `%s:%d` expired %d days ago (%s).",
-			host, port, -leaf.DaysToExpiry, leaf.NotAfter.Format("2006-01-02"))
-	} else if leaf.DaysToExpiry <= certExpiryWarnDays {
-		gLog.Warn(
-			"Certificate for `%s:%d` expires in %d days (%s).",
-			host, port, leaf.DaysToExpiry, leaf.NotAfter.Format("2006-01-02"))
+		// An expiring intermediate breaks the chain just as a leaf does
+		if cert.DaysToExpiry < 0 {
+			gLog.Warn(
+				"Certificate `%s` presented by `%s:%d` expired %d days ago (%s).",
+				cert.Subject, host, port, -cert.DaysToExpiry, cert.NotAfter.Format("2006-01-02"))
+		} else if cert.DaysToExpiry <= certExpiryWarnDays {
+			gLog.Warn(
+				"Certificate `%s` presented by `%s:%d` expires in %d days (%s).",
+				cert.Subject, host, port, cert.DaysToExpiry, cert.NotAfter.Format("2006-01-02"))
+		}
 	}
 
 	if !info.HostMatches {
@@ -65,6 +68,25 @@ func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
 				" names %v for `%s:%d`.",
 			info.DialedHost, info.LeafSANs, host, port)
 	}
+}
+
+// probeTLSChain reports the chain after a failed connection, which leaves no handshake state to inspect
+func probeTLSChain(host string, port int) bool {
+	dialer := &net.Dialer{
+		Timeout: 2000 * time.Millisecond,
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, strconv.Itoa(port)),
+		&tls.Config{InsecureSkipVerify: true, ServerName: host})
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	state := conn.ConnectionState()
+	logTLSChainInfo(host, port, helpers.BuildTLSChainInfo(&state, host, time.Now()))
+
+	return true
 }
 
 func logConnectPhases(host string, port int, timing memd.ConnectTiming, sasl time.Duration) {
@@ -88,7 +110,7 @@ func logConnectPhases(host string, port int, timing memd.ConnectTiming, sasl tim
 
 	gLog.Log("Connect phases for `%s:%d`: %s", host, port, phases)
 
-	if timing.TCP() > 20*time.Millisecond && timing.TCP() > 5*timing.DNS() {
+	if timing.TCP() > 20*time.Millisecond && timing.DNS() > 0 && timing.TCP() > 5*timing.DNS() {
 		gLog.Warn(
 			"TCP handshake to `%s:%d` took %s against %s for DNS resolution --"+
 				" latency appears to be on the network path, not name resolution.",
@@ -106,10 +128,19 @@ func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming) 
 		lock.Unlock()
 	}
 
+	// Connect fires once per address, so keeping the first start covers a failed attempt before the one that worked
+	stampFirst := func(phase *time.Time) {
+		lock.Lock()
+		if phase.IsZero() {
+			*phase = time.Now()
+		}
+		lock.Unlock()
+	}
+
 	trace := &httptrace.ClientTrace{
 		DNSStart:          func(httptrace.DNSStartInfo) { stamp(&timing.DNSStart) },
 		DNSDone:           func(httptrace.DNSDoneInfo) { stamp(&timing.DNSDone) },
-		ConnectStart:      func(string, string) { stamp(&timing.TCPStart) },
+		ConnectStart:      func(string, string) { stampFirst(&timing.TCPStart) },
 		ConnectDone:       func(string, string, error) { stamp(&timing.TCPDone) },
 		TLSHandshakeStart: func() { stamp(&timing.TLSStart) },
 		TLSHandshakeDone:  func(tls.ConnectionState, error) { stamp(&timing.TLSDone) },
@@ -158,7 +189,8 @@ func init() {
 const kvSampleInterval = 100 * time.Millisecond
 const kvMaxErrorStreak = 10
 
-func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) {
+// sampleKVLatency returns false if it gave up early on a connection that kept failing
+func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) bool {
 	var errStreak int
 
 	// Returns false once the connection has failed often enough to stop sampling it
@@ -181,20 +213,22 @@ func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) {
 
 		for time.Now().Before(deadline) {
 			if !sampleOne() {
-				return
+				return false
 			}
 
 			time.Sleep(kvSampleInterval)
 		}
 
-		return
+		return true
 	}
 
 	for i := 0; i < samplesArg; i++ {
 		if !sampleOne() {
-			return
+			return false
 		}
 	}
+
+	return true
 }
 
 var gLog helpers.Logger
@@ -206,6 +240,15 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 			" changes can cause the output of the doctor to be inconsistent or in the\n" +
 			" worst cases, completely incorrect.\n")
 	fmt.Printf("\n")
+
+	if durationArg < 0 || (durationArg == 0 && samplesArg < 1) {
+		gLog.Error("Sampling requires --samples of at least 1, or a positive --duration")
+		return nil
+	}
+
+	if durationArg > 0 && cmd.Flags().Changed("samples") {
+		gLog.Warn("Both --duration and --samples were specified, --samples is ignored")
+	}
 
 	var connStr string
 	if len(args) < 1 {
@@ -377,6 +420,7 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	if err != nil {
 		return terseBucketConfig{}, err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		if resp.StatusCode == 401 {
@@ -413,6 +457,7 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 	if err != nil {
 		return terseBucketConfig{}, err
 	}
+	defer client.Close()
 
 	configBytes, err := client.GetConfig()
 	if err != nil {
@@ -444,7 +489,13 @@ var couchbasePorts = []portDef{
 	{18095, "analyticsSSL"}, {18096, "eventingSSL"}, {18097, "backupSSL"}, {11207, "kvSSL"},
 }
 
-func matrixPorts(nodes []clusterNode) ([]portDef, map[int]bool) {
+// Services an SDK connects to; a cluster also advertises node-internal ports no client ever uses
+var sdkServices = map[string]bool{
+	"kv": true, "mgmt": true, "capi": true, "n1ql": true, "fts": true, "cbas": true,
+	"kvSSL": true, "mgmtSSL": true, "capiSSL": true, "n1qlSSL": true, "ftsSSL": true, "cbasSSL": true,
+}
+
+func matrixPorts(nodes []clusterNode, useTLS bool) ([]portDef, map[int]bool) {
 	names := map[int]string{}
 	for _, p := range couchbasePorts {
 		names[p.Port] = p.Name
@@ -453,8 +504,14 @@ func matrixPorts(nodes []clusterNode) ([]portDef, map[int]bool) {
 	advertised := map[int]bool{}
 	for _, node := range nodes {
 		for name, port := range node.Services {
-			if port != 0 {
-				names[port] = name
+			if port == 0 {
+				continue
+			}
+
+			names[port] = name
+
+			// Only the ports this run's connection scheme would actually be routed to
+			if sdkServices[name] && strings.HasSuffix(name, "SSL") == useTLS {
 				advertised[port] = true
 			}
 		}
@@ -502,10 +559,18 @@ func isDialFailure(err error) bool {
 	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
-func scanPortMatrix(nodes []clusterNode) {
-	ports, advertised := matrixPorts(nodes)
+// httpProbeUnreachable reports whether a failed HTTP service probe never reached the
+// service at all.  The client timeout cancels the whole request, so a host that drops
+// packets fails with a context deadline rather than a dial error; the unfinished TCP
+// phase is what separates it from a service that accepted the connection then stalled.
+func httpProbeUnreachable(err error, timing memd.ConnectTiming) bool {
+	return isDialFailure(err) || timing.TCPDone.IsZero()
+}
 
-	gLog.Log("Scanning %d Couchbase ports across all %d node(s), * marks a port the cluster advertises",
+func scanPortMatrix(nodes []clusterNode, useTLS bool) {
+	ports, advertised := matrixPorts(nodes, useTLS)
+
+	gLog.Log("Scanning %d Couchbase ports across all %d node(s), * marks a port your client connects to",
 		len(ports), len(nodes))
 
 	results := make([][]string, len(nodes))
@@ -641,8 +706,9 @@ func scanPortMatrix(nodes []clusterNode) {
 
 	for _, hosts := range hostGroups {
 		gLog.Warn(
-			"Cluster advertises %d port(s) on `%s` which refuse connections: %s.  Nothing is"+
-				" listening on them, so clients using those services will fail to connect.",
+			"Cluster advertises %d client-facing port(s) on `%s` which refuse connections: %s."+
+				"  Nothing is listening on them, so clients using those services will fail to"+
+				" connect.",
 			len(refusedAdvertised[hosts]), hosts, strings.Join(refusedAdvertised[hosts], ", "))
 	}
 }
@@ -1044,6 +1110,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			if err != nil {
 				gLog.Log("Failed to retreive cluster information (error: %s)", err.Error())
 			} else if resp.StatusCode != 200 {
+				resp.Body.Close()
 				gLog.Log("Failed to retreive cluster information (status code: %d)", resp.StatusCode)
 			} else {
 				if serverTime, dateErr := http.ParseTime(resp.Header.Get("Date")); dateErr == nil {
@@ -1072,6 +1139,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 				var clusterConfig map[string]interface{}
 				json.NewDecoder(resp.Body).Decode(&clusterConfig)
+				resp.Body.Close()
 
 				fmtdConfigNodes, _ := json.MarshalIndent(clusterConfig["nodes"], "", "  ")
 				gLog.Log("Received cluster configuration, nodes list:\n%s", fmtdConfigNodes)
@@ -1082,7 +1150,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	//======================================================================
 	//  PORT MATRIX
 	//======================================================================
-	scanPortMatrix(nodesList)
+	scanPortMatrix(nodesList, tlsConfig != nil)
 
 	//======================================================================
 	//  SERVICES
@@ -1114,6 +1182,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				svcFailed++
 				if isDialFailure(err) {
 					svcUnreachable++
+				} else if tlsConfig != nil && !tlsReported[node.Hostname] {
+					tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)
 				}
 
 				gLog.Error("Failed to connect to %s service at `%s:%d` (error: %s)",
@@ -1150,8 +1220,10 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			resp, err := testHTTPClient.Do(req)
 			if err != nil {
 				svcFailed++
-				if isDialFailure(err) {
+				if httpProbeUnreachable(err, phases()) {
 					svcUnreachable++
+				} else if tlsConfig != nil && !tlsReported[node.Hostname] {
+					tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)
 				}
 
 				gLog.Error("Failed to connect to %s service at `%s:%d` (error: %s)",
@@ -1236,49 +1308,68 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			}
 
 			var stats helpers.PingHelper
-			sampleKVLatency(client, &stats)
+			if !sampleKVLatency(client, &stats) {
+				gLog.Error(
+					"Sampling of `%s:%d` stopped early after %d consecutive failed pings, the"+
+						" connection did not survive the run.",
+					node.Hostname, kvPort, kvMaxErrorStreak)
+			}
+
+			if stats.Successes() == 0 {
+				gLog.Error("All %d pings to `%s:%d` failed, no latency statistics are available",
+					stats.Count(), node.Hostname, kvPort)
+
+				client.Close()
+				continue
+			}
+
+			latencies := fmt.Sprintf("min %s, p50 %s, p90 %s",
+				dur(stats.Min()), dur(stats.Percentile(50)), dur(stats.Percentile(90)))
+
+			// Below 100 samples the 99th percentile is simply the max, so it is not worth a column
+			if stats.Successes() >= 100 {
+				latencies += fmt.Sprintf(", p99 %s", dur(stats.Percentile(99)))
+			}
 
 			gLog.Log(
-				"Memd Nop Pinged `%s:%d` %d times, %d errors:"+
-					" min %s, p50 %s, p90 %s, p99 %s, max %s, stddev %s",
+				"Memd Nop Pinged `%s:%d` %d times, %d errors: %s, max %s, stddev %s",
 				node.Hostname, kvPort,
 				stats.Count(), stats.Errors(),
-				dur(stats.Min()),
-				dur(stats.Percentile(50)),
-				dur(stats.Percentile(90)),
-				dur(stats.Percentile(99)),
-				dur(stats.Max()),
-				dur(stats.StdDev()))
+				latencies, dur(stats.Max()), dur(stats.StdDev()))
 
 			if suspects := helpers.RTOSuspects(stats.Samples()); len(suspects) > 0 {
 				gLog.Error(
 					"%d of %d samples on `%s:%d` landed on a TCP retransmission timeout"+
-						" multiple (slowest: %dms).  This is the signature of packet loss on"+
+						" multiple (slowest: %s).  This is the signature of packet loss on"+
 						" this path rather than of general latency.",
 					len(suspects), stats.Successes(), node.Hostname, kvPort,
-					suspects[len(suspects)-1]/time.Millisecond)
+					dur(suspects[len(suspects)-1]))
 			}
 
 			allowedMeanMs := 10
 			if stats.Mean() >= time.Duration(allowedMeanMs)*time.Millisecond {
 				gLog.Warn(
-					"Memcached service on `%s:%d` on average took longer than %dms (was: %dms) to"+
+					"Memcached service on `%s:%d` on average took longer than %dms (was: %s) to"+
 						" reply.  This is usually due to network-related issues, and could significantly"+
 						" affect application performance.",
 					node.Hostname, kvPort,
-					allowedMeanMs, stats.Mean()/time.Millisecond)
+					allowedMeanMs, dur(stats.Mean()))
 			}
 
-			// Below 100 samples p99 is the max, so short runs are unchanged.
+			tailName := "at its slowest"
+			if stats.Successes() >= 100 {
+				tailName = "at the 99th percentile"
+			}
+
 			allowedMaxMs := 20
 			tail := stats.Percentile(99)
 			if tail >= time.Duration(allowedMaxMs)*time.Millisecond {
 				gLog.Warn(
-					"Memcached service on `%s:%d` at the 99th percentile took longer than %dms"+
-						" (was: %dms) to reply.  This is usually due to network-related issues,"+
-						" and could significantly affect application performance.",
+					"Memcached service on `%s:%d` %s took longer than %dms (was: %s) to reply."+
+						"  This is usually due to network-related issues, and could significantly"+
+						" affect application performance.",
 					node.Hostname, kvPort,
-					allowedMaxMs, tail/time.Millisecond)
+					tailName, allowedMaxMs, dur(tail))
 			}
 
 			client.Close()

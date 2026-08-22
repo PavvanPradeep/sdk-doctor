@@ -44,7 +44,12 @@ func BuildTLSChainInfo(state *tls.ConnectionState, dialedHost string, now time.T
 
 	if len(state.PeerCertificates) > 0 {
 		leaf := state.PeerCertificates[0]
-		info.LeafSANs = leaf.DNSNames
+
+		info.LeafSANs = append([]string(nil), leaf.DNSNames...)
+		for _, ip := range leaf.IPAddresses {
+			info.LeafSANs = append(info.LeafSANs, ip.String())
+		}
+
 		info.HostMatches = certificateMatchesHost(leaf, dialedHost)
 	}
 
