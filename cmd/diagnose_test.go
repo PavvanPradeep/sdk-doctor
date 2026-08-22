@@ -28,7 +28,7 @@ func TestGetSourceNodeExt(t *testing.T) {
 }
 
 func TestMatrixPorts(t *testing.T) {
-	ports := matrixPorts([]clusterNode{
+	ports, advertised := matrixPorts([]clusterNode{
 		{Hostname: "a", Services: map[string]int{"indexAdmin": 9100, "kv": 11210}},
 		{Hostname: "b", Services: map[string]int{"projector": 9999, "capi": 0}},
 	})
@@ -48,6 +48,15 @@ func TestMatrixPorts(t *testing.T) {
 	}
 	if _, ok := got[0]; ok {
 		t.Fatalf("zero port should not be probed: %+v", ports)
+	}
+
+	for _, want := range []int{9100, 9999, 11210} {
+		if !advertised[want] {
+			t.Fatalf("port %d is advertised by a node, got %+v", want, advertised)
+		}
+	}
+	if advertised[8091] || advertised[0] {
+		t.Fatalf("only ports a node advertises are advertised, got %+v", advertised)
 	}
 }
 

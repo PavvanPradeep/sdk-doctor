@@ -31,6 +31,11 @@ func stripIPv6Address(address string) string {
 	return address
 }
 
+// dur formats a duration for the log, as most connect phases are sub-millisecond
+func dur(d time.Duration) string {
+	return d.Round(time.Microsecond).String()
+}
+
 const certExpiryWarnDays = 30
 
 func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
@@ -67,23 +72,27 @@ func logConnectPhases(host string, port int, timing memd.ConnectTiming, sasl tim
 		return
 	}
 
-	phases := fmt.Sprintf("dns %dms, tcp %dms",
-		timing.DNS()/time.Millisecond, timing.TCP()/time.Millisecond)
+	dns := "-"
+	if !timing.DNSStart.IsZero() {
+		dns = dur(timing.DNS())
+	}
+
+	phases := fmt.Sprintf("dns %s, tcp %s", dns, dur(timing.TCP()))
 
 	if !timing.TLSStart.IsZero() {
-		phases += fmt.Sprintf(", tls %dms", timing.TLS()/time.Millisecond)
+		phases += fmt.Sprintf(", tls %s", dur(timing.TLS()))
 	}
 	if sasl > 0 {
-		phases += fmt.Sprintf(", sasl %dms", sasl/time.Millisecond)
+		phases += fmt.Sprintf(", sasl %s", dur(sasl))
 	}
 
 	gLog.Log("Connect phases for `%s:%d`: %s", host, port, phases)
 
 	if timing.TCP() > 20*time.Millisecond && timing.TCP() > 5*timing.DNS() {
 		gLog.Warn(
-			"TCP handshake to `%s:%d` took %dms against %dms for DNS resolution --"+
+			"TCP handshake to `%s:%d` took %s against %s for DNS resolution --"+
 				" latency appears to be on the network path, not name resolution.",
-			host, port, timing.TCP()/time.Millisecond, timing.DNS()/time.Millisecond)
+			host, port, dur(timing.TCP()), dur(timing.DNS()))
 	}
 }
 
@@ -435,16 +444,18 @@ var couchbasePorts = []portDef{
 	{18095, "analyticsSSL"}, {18096, "eventingSSL"}, {18097, "backupSSL"}, {11207, "kvSSL"},
 }
 
-func matrixPorts(nodes []clusterNode) []portDef {
+func matrixPorts(nodes []clusterNode) ([]portDef, map[int]bool) {
 	names := map[int]string{}
 	for _, p := range couchbasePorts {
 		names[p.Port] = p.Name
 	}
 
+	advertised := map[int]bool{}
 	for _, node := range nodes {
 		for name, port := range node.Services {
 			if port != 0 {
 				names[port] = name
+				advertised[port] = true
 			}
 		}
 	}
@@ -455,7 +466,7 @@ func matrixPorts(nodes []clusterNode) []portDef {
 	}
 	sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
 
-	return ports
+	return ports, advertised
 }
 
 // Windows reports refusals as WSAECONNREFUSED, which does not match syscall.ECONNREFUSED.
@@ -492,9 +503,10 @@ func isDialFailure(err error) bool {
 }
 
 func scanPortMatrix(nodes []clusterNode) {
-	ports := matrixPorts(nodes)
+	ports, advertised := matrixPorts(nodes)
 
-	gLog.Log("Scanning %d Couchbase ports across all %d node(s)", len(ports), len(nodes))
+	gLog.Log("Scanning %d Couchbase ports across all %d node(s), * marks a port the cluster advertises",
+		len(ports), len(nodes))
 
 	results := make([][]string, len(nodes))
 	resolved := make([]bool, len(nodes))
@@ -560,7 +572,12 @@ func scanPortMatrix(nodes []clusterNode) {
 
 		header := fmt.Sprintf("%-*s", nameWidth, "PORT MATRIX")
 		for _, p := range ports[start:end] {
-			header += fmt.Sprintf(" %8d", p.Port)
+			label := strconv.Itoa(p.Port)
+			if advertised[p.Port] {
+				label = "*" + label
+			}
+
+			header += fmt.Sprintf(" %8s", label)
 		}
 		gLog.Log("%s", header)
 
@@ -572,6 +589,8 @@ func scanPortMatrix(nodes []clusterNode) {
 			gLog.Log("%s", row)
 		}
 	}
+
+	refusedAdvertised := map[string][]string{}
 
 	for j, p := range ports {
 		var filtered, refused, open []string
@@ -601,13 +620,30 @@ func scanPortMatrix(nodes []clusterNode) {
 				p.Port, p.Name, strings.Join(filtered, ", "))
 		}
 
-		if len(refused) > 0 && len(open) > 0 {
+		if len(refused) > 0 && advertised[p.Port] {
+			hosts := strings.Join(refused, ", ")
+			refusedAdvertised[hosts] = append(refusedAdvertised[hosts],
+				fmt.Sprintf("%d (%s)", p.Port, p.Name))
+		} else if len(refused) > 0 && len(open) > 0 {
 			gLog.Warn(
 				"Port %d (%s) is refused on `%s` but open on %d other node(s).  Nothing is"+
 					" listening there, which indicates the service is down on those nodes rather"+
 					" than a network problem.",
 				p.Port, p.Name, strings.Join(refused, ", "), len(open))
 		}
+	}
+
+	hostGroups := make([]string, 0, len(refusedAdvertised))
+	for hosts := range refusedAdvertised {
+		hostGroups = append(hostGroups, hosts)
+	}
+	sort.Strings(hostGroups)
+
+	for _, hosts := range hostGroups {
+		gLog.Warn(
+			"Cluster advertises %d port(s) on `%s` which refuse connections: %s.  Nothing is"+
+				" listening on them, so clients using those services will fail to connect.",
+			len(refusedAdvertised[hosts]), hosts, strings.Join(refusedAdvertised[hosts], ", "))
 	}
 }
 
@@ -1019,6 +1055,13 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 						direction = "behind"
 					}
 
+					if skew < 2*time.Second {
+						gLog.Log("Local clock is in sync with node `%s`", infoSourceHost)
+					} else {
+						gLog.Log("Local clock is %s %s node `%s`",
+							skew.Round(time.Second), direction, infoSourceHost)
+					}
+
 					if skew >= 30*time.Second {
 						gLog.Error(
 							"Local clock is %s %s node `%s`.  Clock skew breaks certificate"+
@@ -1177,9 +1220,13 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			firstOpStart := time.Now()
 			firstOpErr := client.Ping()
 			firstOpDuration := time.Since(firstOpStart)
-			gLog.Log(
-				"First operation on `%s:%d` completed in %dms (error: %v)",
-				node.Hostname, kvPort, firstOpDuration/time.Millisecond, firstOpErr)
+			if firstOpErr != nil {
+				gLog.Error("First operation on `%s:%d` failed after %s (error: %s)",
+					node.Hostname, kvPort, dur(firstOpDuration), firstOpErr)
+			} else {
+				gLog.Log("First operation on `%s:%d` completed in %s",
+					node.Hostname, kvPort, dur(firstOpDuration))
+			}
 
 			if client.TLSState() != nil && !tlsReported[node.Hostname] {
 				tlsReported[node.Hostname] = true
@@ -1191,23 +1238,17 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			var stats helpers.PingHelper
 			sampleKVLatency(client, &stats)
 
-			gLog.Log("Memd Nop Pinged `%s:%d` %d times, %d errors, %dms min, %dms max, %dms mean",
+			gLog.Log(
+				"Memd Nop Pinged `%s:%d` %d times, %d errors:"+
+					" min %s, p50 %s, p90 %s, p99 %s, max %s, stddev %s",
 				node.Hostname, kvPort,
 				stats.Count(), stats.Errors(),
-				stats.Min()/time.Millisecond,
-				stats.Max()/time.Millisecond,
-				stats.Mean()/time.Millisecond)
-
-			if stats.Successes() > 0 {
-				gLog.Log(
-					"KV latency distribution on `%s:%d` over %d samples:"+
-						" p50 %dms, p90 %dms, p99 %dms, stddev %dms",
-					node.Hostname, kvPort, stats.Successes(),
-					stats.Percentile(50)/time.Millisecond,
-					stats.Percentile(90)/time.Millisecond,
-					stats.Percentile(99)/time.Millisecond,
-					stats.StdDev()/time.Millisecond)
-			}
+				dur(stats.Min()),
+				dur(stats.Percentile(50)),
+				dur(stats.Percentile(90)),
+				dur(stats.Percentile(99)),
+				dur(stats.Max()),
+				dur(stats.StdDev()))
 
 			if suspects := helpers.RTOSuspects(stats.Samples()); len(suspects) > 0 {
 				gLog.Error(
