@@ -68,18 +68,17 @@ func (client *MemdClient) Close() {
 	client.conn.Close()
 }
 
-// Timing returns the per-phase timing gathered while dialing this connection.
+// Timing returns the per-phase dial timing
 func (client *MemdClient) Timing() memd.ConnectTiming {
 	return client.timing
 }
 
-// TLSState returns the negotiated TLS connection state, or nil if this
-// connection is not using TLS.
+// TLSState returns the negotiated TLS state, or nil without TLS
 func (client *MemdClient) TLSState() *tls.ConnectionState {
 	return client.tlsState
 }
 
-// SASLDuration returns how long SASL authentication took.
+// SASLDuration returns how long SASL authentication took
 func (client *MemdClient) SASLDuration() time.Duration {
 	return client.saslDuration
 }
@@ -204,12 +203,15 @@ func (client *MemdClient) GetConfig() ([]byte, error) {
 func (client *MemdClient) Ping() error {
 	var resp memd.Response
 
-	client.conn.WritePacket(&memd.Request{
+	err := client.conn.WritePacket(&memd.Request{
 		Magic:  memd.ReqMagic,
 		Opcode: memd.CmdNop,
 	})
+	if err != nil {
+		return err
+	}
 
-	err := client.conn.ReadPacket(&resp)
+	err = client.conn.ReadPacket(&resp)
 	if err != nil {
 		return err
 	}

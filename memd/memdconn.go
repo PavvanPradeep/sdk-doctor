@@ -48,8 +48,7 @@ type ReadWriteCloser interface {
 	Close() error
 }
 
-// ConnectTiming records how long each phase of establishing a memd
-// connection took. TLSStart/TLSDone stay zero when no TLS was negotiated.
+// ConnectTiming records each dial phase; the TLS fields stay zero without TLS
 type ConnectTiming struct {
 	DNSStart time.Time
 	DNSDone  time.Time
@@ -69,8 +68,7 @@ func (t ConnectTiming) TCP() time.Duration {
 	return t.TCPDone.Sub(t.TCPStart)
 }
 
-// TLS returns how long the TLS handshake took, or zero if the connection
-// did not use TLS.
+// TLS returns how long the TLS handshake took, or zero without TLS
 func (t ConnectTiming) TLS() time.Duration {
 	if t.TLSStart.IsZero() {
 		return 0
@@ -78,8 +76,7 @@ func (t ConnectTiming) TLS() time.Duration {
 	return t.TLSDone.Sub(t.TLSStart)
 }
 
-// DialResult carries a dialed memd connection along with diagnostic
-// information gathered while establishing it.
+// DialResult carries a dialed memd connection and its dial diagnostics
 type DialResult struct {
 	Conn     ReadWriteCloser
 	Timing   ConnectTiming
@@ -117,14 +114,20 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		return nil, fmt.Errorf("no addresses found for host `%s`", host)
 	}
 
-	resolvedAddr := net.JoinHostPort(ips[0], port)
-
 	d := net.Dialer{
 		Deadline: deadline,
 	}
 
+	// Try every resolved address rather than only the first, as the standard dialer does
+	var baseConn net.Conn
+
 	timing.TCPStart = time.Now()
-	baseConn, err := d.Dial("tcp", resolvedAddr)
+	for _, ip := range ips {
+		baseConn, err = d.Dial("tcp", net.JoinHostPort(ip, port))
+		if err == nil {
+			break
+		}
+	}
 	timing.TCPDone = time.Now()
 	if err != nil {
 		return nil, err

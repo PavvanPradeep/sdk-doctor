@@ -6,9 +6,6 @@ import (
 	"time"
 )
 
-// startEchoListener starts a TCP listener that accepts one connection and
-// then blocks until the test closes it. It's enough to exercise DialMemdConn's
-// non-TLS path without needing a real memcached server.
 func startEchoListener(t *testing.T) (addr string, closeFn func()) {
 	t.Helper()
 

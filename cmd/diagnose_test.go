@@ -1,14 +1,17 @@
 package cmd
 
 import (
+	"crypto/tls"
+	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 )
 
 func TestGetSourceNodeExt(t *testing.T) {
-	// A cluster with no thisNode must report nil rather than panic the caller.
 	none := terseBucketConfig{NodesExt: []bucketConfigNodeExt{
 		{Hostname: "a"}, {Hostname: "b"},
 	}}
@@ -16,7 +19,6 @@ func TestGetSourceNodeExt(t *testing.T) {
 		t.Fatalf("expected nil, got %+v", got)
 	}
 
-	// And when one is present, it must be the flagged node.
 	some := terseBucketConfig{NodesExt: []bucketConfigNodeExt{
 		{Hostname: "a"}, {Hostname: "b", ThisNode: true},
 	}}
@@ -39,8 +41,6 @@ func TestMatrixPorts(t *testing.T) {
 			t.Fatalf("ports are not sorted/deduped at %d: %+v", i, ports)
 		}
 	}
-
-	// Advertised ports join the documented ones, and a zero port is not a port.
 	for _, want := range []int{8091, 9100, 9999, 11210} {
 		if _, ok := got[want]; !ok {
 			t.Fatalf("expected port %d in matrix, got %+v", want, ports)
@@ -52,7 +52,6 @@ func TestMatrixPorts(t *testing.T) {
 }
 
 func TestProbePort(t *testing.T) {
-	// No coverage for "filtered" - that needs packets actually dropped.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %s", err)
@@ -69,5 +68,73 @@ func TestProbePort(t *testing.T) {
 
 	if got := probePort("127.0.0.1", port, time.Second); got != "refused" {
 		t.Fatalf("closed port: expected refused, got %s", got)
+	}
+}
+
+func TestTraceRequest(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	req, phases := traceRequest(req)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %s", err)
+	}
+	resp.Body.Close()
+
+	timing := phases()
+
+	if timing.TCPStart.IsZero() || timing.TCP() <= 0 {
+		t.Fatalf("tcp phase not recorded: %+v", timing)
+	}
+	if timing.TLSStart.IsZero() || timing.TLS() <= 0 {
+		t.Fatalf("tls phase not recorded: %+v", timing)
+	}
+
+	if resp.TLS == nil {
+		t.Fatal("expected TLS connection state on the response")
+	}
+}
+
+func TestIsDialFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+	closedAddr := ln.Addr().String()
+	ln.Close()
+
+	_, dialErr := net.Dial("tcp", closedAddr)
+	if !isDialFailure(dialErr) {
+		t.Fatalf("a refused dial is a dial failure, got %v", dialErr)
+	}
+
+	_, httpErr := http.Get("http://" + closedAddr)
+	if !isDialFailure(httpErr) {
+		t.Fatalf("a refused http dial is a dial failure, got %v", httpErr)
+	}
+
+	// An untrusted certificate must not be mistaken for an unreachable network
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	_, tlsErr := http.Get(srv.URL)
+	if tlsErr == nil {
+		t.Fatal("expected the default client to reject the test certificate")
+	}
+	if isDialFailure(tlsErr) {
+		t.Fatalf("a TLS rejection is not a dial failure, got %v", tlsErr)
+	}
+
+	if isDialFailure(errors.New("invalid bucket name/password")) {
+		t.Fatal("an auth rejection is not a dial failure")
 	}
 }
