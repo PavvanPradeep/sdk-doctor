@@ -128,20 +128,31 @@ func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming) 
 		lock.Unlock()
 	}
 
-	// Connect fires once per address, so keeping the first start covers a failed attempt before the one that worked
-	stampFirst := func(phase *time.Time) {
+	// A dual-stack host races its addresses, so starts are paired by address, not by order
+	starts := map[string]time.Time{}
+
+	connectStart := func(_, addr string) {
 		lock.Lock()
-		if phase.IsZero() {
-			*phase = time.Now()
-		}
+		starts[addr] = time.Now()
 		lock.Unlock()
+	}
+
+	connectDone := func(_, addr string, err error) {
+		lock.Lock()
+		defer lock.Unlock()
+
+		// A failed attempt stays unstamped, which is what marks a service as never reached
+		if start, ok := starts[addr]; err == nil && ok {
+			timing.TCPStart = start
+			timing.TCPDone = time.Now()
+		}
 	}
 
 	trace := &httptrace.ClientTrace{
 		DNSStart:          func(httptrace.DNSStartInfo) { stamp(&timing.DNSStart) },
 		DNSDone:           func(httptrace.DNSDoneInfo) { stamp(&timing.DNSDone) },
-		ConnectStart:      func(string, string) { stampFirst(&timing.TCPStart) },
-		ConnectDone:       func(string, string, error) { stamp(&timing.TCPDone) },
+		ConnectStart:      connectStart,
+		ConnectDone:       connectDone,
 		TLSHandshakeStart: func() { stamp(&timing.TLSStart) },
 		TLSHandshakeDone:  func(tls.ConnectionState, error) { stamp(&timing.TLSDone) },
 	}
@@ -173,6 +184,7 @@ var (
 	bucketPasswordArg string
 	samplesArg        int
 	durationArg       time.Duration
+	rtoMinArg         time.Duration
 )
 
 func init() {
@@ -184,6 +196,7 @@ func init() {
 	diagnoseCmd.PersistentFlags().StringVarP(&bucketPasswordArg, "bucket-password", "z", "", "bucket password (deprecated, use password instead)")
 	diagnoseCmd.PersistentFlags().IntVar(&samplesArg, "samples", 10, "number of KV latency samples to collect per node")
 	diagnoseCmd.PersistentFlags().DurationVar(&durationArg, "duration", 0, "sample KV latency for this long per node instead of a fixed count (e.g. 60s)")
+	diagnoseCmd.PersistentFlags().DurationVar(&rtoMinArg, "rto-min", helpers.DefaultRTOMin, "this client OS's minimum TCP retransmission timeout, used to tell packet loss from latency")
 }
 
 const kvSampleInterval = 100 * time.Millisecond
@@ -561,8 +574,7 @@ func isDialFailure(err error) bool {
 
 // httpProbeUnreachable reports whether a failed HTTP service probe never reached the
 // service at all.  The client timeout cancels the whole request, so a host that drops
-// packets fails with a context deadline rather than a dial error; the unfinished TCP
-// phase is what separates it from a service that accepted the connection then stalled.
+// packets fails with a context deadline rather than a dial error
 func httpProbeUnreachable(err error, timing memd.ConnectTiming) bool {
 	return isDialFailure(err) || timing.TCPDone.IsZero()
 }
@@ -574,13 +586,19 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 		len(ports), len(nodes))
 
 	results := make([][]string, len(nodes))
-	resolved := make([]bool, len(nodes))
+
+	// Reused by every port probe; a node behind several A records is probed at the first only
+	addrs := make([]string, len(nodes))
 	resolvedCount := 0
 
 	for i, node := range nodes {
 		results[i] = make([]string, len(ports))
 
-		if _, err := net.LookupHost(node.Hostname); err != nil {
+		ips, err := net.LookupHost(node.Hostname)
+		if err == nil && len(ips) == 0 {
+			err = fmt.Errorf("no addresses found")
+		}
+		if err != nil {
 			for j := range ports {
 				results[i][j] = "dns"
 			}
@@ -593,7 +611,7 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 			continue
 		}
 
-		resolved[i] = true
+		addrs[i] = ips[0]
 		resolvedCount++
 	}
 
@@ -601,7 +619,7 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	var wg sync.WaitGroup
 
 	for i := range nodes {
-		if !resolved[i] {
+		if addrs[i] == "" {
 			continue
 		}
 
@@ -614,7 +632,7 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				results[i][j] = probePort(nodes[i].Hostname, ports[j].Port,
+				results[i][j] = probePort(addrs[i], ports[j].Port,
 					2000*time.Millisecond)
 			}(i, j)
 		}
@@ -689,7 +707,9 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 			hosts := strings.Join(refused, ", ")
 			refusedAdvertised[hosts] = append(refusedAdvertised[hosts],
 				fmt.Sprintf("%d (%s)", p.Port, p.Name))
-		} else if len(refused) > 0 && len(open) > 0 {
+		}
+
+		if len(refused) > 0 && len(open) > 0 {
 			gLog.Warn(
 				"Port %d (%s) is refused on `%s` but open on %d other node(s).  Nothing is"+
 					" listening there, which indicates the service is down on those nodes rather"+
@@ -1266,6 +1286,15 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				" resolve or route from here.  Configure alternate addresses on the cluster so"+
 				" it advertises externally reachable hostnames to clients like this one.",
 			svcFailed, selectedNetwork)
+	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 {
+		gLog.Error(
+			"Bootstrap succeeded and every one of the %d advertised service endpoints accepted"+
+				" the connection, but none of them completed it.  The network path is fine, so"+
+				" the fault is in the handshake itself: check that the certificate authority you"+
+				" passed signs the cluster's certificates, that those certificates cover the"+
+				" hostnames the cluster advertises on the `%s` network, and that the credentials"+
+				" are valid.  The per-service errors above name the specific failure.",
+			svcFailed, selectedNetwork)
 	}
 
 	//======================================================================
@@ -1337,7 +1366,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				stats.Count(), stats.Errors(),
 				latencies, dur(stats.Max()), dur(stats.StdDev()))
 
-			if suspects := helpers.RTOSuspects(stats.Samples()); len(suspects) > 0 {
+			if suspects := helpers.RTOSuspects(stats.Samples(), rtoMinArg); len(suspects) > 0 {
 				gLog.Error(
 					"%d of %d samples on `%s:%d` landed on a TCP retransmission timeout"+
 						" multiple (slowest: %s).  This is the signature of packet loss on"+

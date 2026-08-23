@@ -122,16 +122,15 @@ func (ph *PingHelper) StdDev() time.Duration {
 	return time.Duration(math.Sqrt(sumSquares / float64(len(ph.samples))))
 }
 
-// rtoMin is the shortest TCP retransmission timeout; it doubles per retry
-const rtoMin = 200 * time.Millisecond
+// DefaultRTOMin is the Linux and BSD retransmission floor; other stacks differ
+const DefaultRTOMin = 200 * time.Millisecond
 
 // rtoTolerance covers jitter; bands stay disjoint below 1/3
 const rtoTolerance = 0.20
 
-// RTOSuspects returns ascending samples near an RTO multiple, ignoring any
-// not well clear of the median so a slow link is not read as packet loss
-func RTOSuspects(samples []time.Duration) []time.Duration {
-	if len(samples) < 4 {
+// RTOSuspects returns ascending samples near an rtoMin multiple and clear of the median, the signature of packet loss
+func RTOSuspects(samples []time.Duration, rtoMin time.Duration) []time.Duration {
+	if len(samples) < 4 || rtoMin <= 0 {
 		return nil
 	}
 

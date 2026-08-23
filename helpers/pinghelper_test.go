@@ -84,7 +84,7 @@ func TestRTOSuspects(t *testing.T) {
 	fast := []int{2, 2, 2, 2, 2, 2, 2, 2, 2, 2}
 
 	loss := append([]int{816, 204, 408}, fast...)
-	got := RTOSuspects(ms(loss...))
+	got := RTOSuspects(ms(loss...), DefaultRTOMin)
 
 	want := ms(204, 408, 816)
 	if len(got) != len(want) {
@@ -96,17 +96,28 @@ func TestRTOSuspects(t *testing.T) {
 		}
 	}
 
-	if got := RTOSuspects(ms(append([]int{300}, fast...)...)); got != nil {
+	if got := RTOSuspects(ms(append([]int{300}, fast...)...), DefaultRTOMin); got != nil {
 		t.Fatalf("300ms is not an RTO multiple, got %v", got)
 	}
 
 	slow := ms(190, 195, 200, 205, 198, 202, 191, 209, 197, 203)
-	if got := RTOSuspects(slow); got != nil {
+	if got := RTOSuspects(slow, DefaultRTOMin); got != nil {
 		t.Fatalf("slow link should not be flagged as loss, got %v", got)
 	}
 
-	if got := RTOSuspects(ms(2, 204)); got != nil {
+	if got := RTOSuspects(ms(2, 204), DefaultRTOMin); got != nil {
 		t.Fatalf("expected nil for a tiny sample, got %v", got)
+	}
+
+	// A client OS with a different RTO floor moves the bands with it
+	if got := RTOSuspects(ms(append([]int{300}, fast...)...), 300*time.Millisecond); len(got) != 1 {
+		t.Fatalf("300ms is an RTO multiple at a 300ms floor, got %v", got)
+	}
+	if got := RTOSuspects(ms(loss...), 300*time.Millisecond); got != nil {
+		t.Fatalf("the 200ms bands should not match at a 300ms floor, got %v", got)
+	}
+	if got := RTOSuspects(ms(loss...), 0); got != nil {
+		t.Fatalf("a zero floor disables the check, got %v", got)
 	}
 }
 

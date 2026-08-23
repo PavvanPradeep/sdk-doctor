@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
@@ -246,5 +247,69 @@ func TestHTTPProbeUnreachable(t *testing.T) {
 	}
 	if !httpProbeUnreachable(refused, connected) {
 		t.Fatal("a refused probe is unreachable")
+	}
+}
+
+func TestTraceRequestPairsRacingConnects(t *testing.T) {
+	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
+	req, phases := traceRequest(req)
+
+	trace := httptrace.ContextClientTrace(req.Context())
+	trace.ConnectStart("tcp", "[::1]:8091")
+	time.Sleep(30 * time.Millisecond)
+	trace.ConnectStart("tcp", "127.0.0.1:8091")
+	trace.ConnectDone("tcp", "[::1]:8091", errors.New("no route to host"))
+	trace.ConnectDone("tcp", "127.0.0.1:8091", nil)
+
+	if got := phases().TCP(); got > 10*time.Millisecond {
+		t.Fatalf("expected only the successful attempt to be timed, got %s", got)
+	}
+}
+
+func TestTraceRequestLeavesFailedConnectUnstamped(t *testing.T) {
+	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
+	req, phases := traceRequest(req)
+
+	trace := httptrace.ContextClientTrace(req.Context())
+	trace.ConnectStart("tcp", "127.0.0.1:8091")
+	trace.ConnectDone("tcp", "127.0.0.1:8091", errors.New("connection refused"))
+
+	timing := phases()
+	if !timing.TCPDone.IsZero() {
+		t.Fatalf("a failed connect must not stamp the phase, got %s", timing.TCPDone)
+	}
+	if !httpProbeUnreachable(errors.New("some wrapped error"), timing) {
+		t.Fatal("expected an unfinished TCP phase to read as unreachable")
+	}
+}
+
+func TestScanPortMatrixReportsBothRefusalDiagnoses(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+	defer ln.Close()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	openPort, _ := strconv.Atoi(portStr)
+
+	// The v6 loopback is a distinct address, so a v4-only listener is refused there
+	if probePort("::1", openPort, time.Second) != "refused" {
+		t.Skip("no usable IPv6 loopback to contrast against")
+	}
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+
+	scanPortMatrix([]clusterNode{
+		{Hostname: "127.0.0.1", Services: map[string]int{"mgmt": openPort}},
+		{Hostname: "::1", Services: map[string]int{"mgmt": openPort}},
+	}, false)
+
+	for _, want := range []string{"Cluster advertises", "the service is down on those nodes"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("expected `%s` in the output:\n%s", want, out.String())
+		}
 	}
 }

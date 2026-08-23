@@ -89,6 +89,16 @@ type memdConn struct {
 	recvBuf []byte
 }
 
+// attemptDeadline splits the time left evenly, so a filtered address cannot swallow it all
+func attemptDeadline(deadline, now time.Time, remainingAddrs int) time.Time {
+	remaining := deadline.Sub(now)
+	if deadline.IsZero() || remainingAddrs <= 1 || remaining <= 0 {
+		return deadline
+	}
+
+	return now.Add(remaining / time.Duration(remainingAddrs))
+}
+
 // DialMemdConn dials a memcached connection
 func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*DialResult, error) {
 	var timing ConnectTiming
@@ -120,21 +130,22 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		}
 	}
 
-	d := net.Dialer{
-		Deadline: deadline,
-	}
-
 	// Try every resolved address rather than only the first, as the standard dialer does
 	var baseConn net.Conn
 
-	timing.TCPStart = time.Now()
-	for _, ip := range ips {
+	for i, ip := range ips {
+		d := net.Dialer{
+			Deadline: attemptDeadline(deadline, time.Now(), len(ips)-i),
+		}
+
+		// Re-stamped per attempt so the reported handshake covers only the one that connected
+		timing.TCPStart = time.Now()
 		baseConn, err = d.Dial("tcp", net.JoinHostPort(ip, port))
+		timing.TCPDone = time.Now()
 		if err == nil {
 			break
 		}
 	}
-	timing.TCPDone = time.Now()
 	if err != nil {
 		return nil, err
 	}

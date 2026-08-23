@@ -100,3 +100,25 @@ func TestDialMemdConnZeroDeadline(t *testing.T) {
 	}
 	defer result.Conn.Close()
 }
+
+func TestAttemptDeadlineSplitsTheTimeLeft(t *testing.T) {
+	now := time.Now()
+
+	// Three addresses left, so the first attempt may spend a third of the budget
+	if got := attemptDeadline(now.Add(3*time.Second), now, 3); got.Sub(now) != time.Second {
+		t.Errorf("expected a 1s slice of a 3s deadline, got %s", got.Sub(now))
+	}
+
+	if got := attemptDeadline(now.Add(3*time.Second), now, 1); got.Sub(now) != 3*time.Second {
+		t.Errorf("the last attempt should keep the whole deadline, got %s", got.Sub(now))
+	}
+
+	if got := attemptDeadline(time.Time{}, now, 3); !got.IsZero() {
+		t.Errorf("a zero deadline must stay unbounded, got %s", got)
+	}
+
+	passed := now.Add(-time.Second)
+	if got := attemptDeadline(passed, now, 3); !got.Equal(passed) {
+		t.Errorf("expected the passed deadline back, got %s", got)
+	}
+}
