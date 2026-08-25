@@ -45,11 +45,11 @@ type Dialer interface {
 type ReadWriteCloser interface {
 	WritePacket(*Request) error
 	ReadPacket(*Response) error
+	SetDeadline(time.Time) error
 	Close() error
 }
 
-// ConnectTiming records how long each phase of establishing a memd
-// connection took. TLSStart/TLSDone stay zero when no TLS was negotiated.
+// ConnectTiming records each dial phase; the TLS fields stay zero without TLS
 type ConnectTiming struct {
 	DNSStart time.Time
 	DNSDone  time.Time
@@ -69,8 +69,7 @@ func (t ConnectTiming) TCP() time.Duration {
 	return t.TCPDone.Sub(t.TCPStart)
 }
 
-// TLS returns how long the TLS handshake took, or zero if the connection
-// did not use TLS.
+// TLS returns how long the TLS handshake took, or zero without TLS
 func (t ConnectTiming) TLS() time.Duration {
 	if t.TLSStart.IsZero() {
 		return 0
@@ -78,8 +77,7 @@ func (t ConnectTiming) TLS() time.Duration {
 	return t.TLSDone.Sub(t.TLSStart)
 }
 
-// DialResult carries a dialed memd connection along with diagnostic
-// information gathered while establishing it.
+// DialResult carries a dialed memd connection and its dial diagnostics
 type DialResult struct {
 	Conn     ReadWriteCloser
 	Timing   ConnectTiming
@@ -89,6 +87,16 @@ type DialResult struct {
 type memdConn struct {
 	conn    io.ReadWriteCloser
 	recvBuf []byte
+}
+
+// attemptDeadline splits the time left evenly, so a filtered address cannot swallow it all
+func attemptDeadline(deadline, now time.Time, remainingAddrs int) time.Time {
+	remaining := deadline.Sub(now)
+	if deadline.IsZero() || remainingAddrs <= 1 || remaining <= 0 {
+		return deadline
+	}
+
+	return now.Add(remaining / time.Duration(remainingAddrs))
 }
 
 // DialMemdConn dials a memcached connection
@@ -107,31 +115,46 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		resolveCtx = ctx
 	}
 
-	timing.DNSStart = time.Now()
-	ips, err := net.DefaultResolver.LookupHost(resolveCtx, host)
-	timing.DNSDone = time.Now()
-	if err != nil {
-		return nil, err
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no addresses found for host `%s`", host)
+	// An IP literal is never resolved, so stamping the DNS phase would report a lookup that never happened
+	ips := []string{host}
+	if net.ParseIP(host) == nil {
+		timing.DNSStart = time.Now()
+		ips, err = net.DefaultResolver.LookupHost(resolveCtx, host)
+		timing.DNSDone = time.Now()
+		if err != nil {
+			return nil, err
+		}
+
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no addresses found for host `%s`", host)
+		}
 	}
 
-	resolvedAddr := net.JoinHostPort(ips[0], port)
+	// Try every resolved address rather than only the first, as the standard dialer does
+	var baseConn net.Conn
 
-	d := net.Dialer{
-		Deadline: deadline,
+	for i, ip := range ips {
+		d := net.Dialer{
+			Deadline: attemptDeadline(deadline, time.Now(), len(ips)-i),
+		}
+
+		// Re-stamped per attempt so the reported handshake covers only the one that connected
+		timing.TCPStart = time.Now()
+		baseConn, err = d.Dial("tcp", net.JoinHostPort(ip, port))
+		timing.TCPDone = time.Now()
+		if err == nil {
+			break
+		}
 	}
-
-	timing.TCPStart = time.Now()
-	baseConn, err := d.Dial("tcp", resolvedAddr)
-	timing.TCPDone = time.Now()
 	if err != nil {
 		return nil, err
 	}
 
 	tcpConn := baseConn.(*net.TCPConn)
 	tcpConn.SetNoDelay(false)
+
+	// The dialer deadline does not cover the handshake, and a peer that accepts then stalls would hang forever
+	tcpConn.SetDeadline(deadline)
 
 	var conn io.ReadWriteCloser
 	var tlsState *tls.ConnectionState
@@ -144,6 +167,7 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		err = tlsConn.Handshake()
 		timing.TLSDone = time.Now()
 		if err != nil {
+			tcpConn.Close()
 			return nil, err
 		}
 
@@ -164,6 +188,16 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 
 func (s *memdConn) Close() error {
 	return s.conn.Close()
+}
+
+// SetDeadline bounds every subsequent read and write, or clears the bound with a zero time
+func (s *memdConn) SetDeadline(t time.Time) error {
+	conn, ok := s.conn.(net.Conn)
+	if !ok {
+		return nil
+	}
+
+	return conn.SetDeadline(t)
 }
 
 func (s *memdConn) WritePacket(req *Request) error {

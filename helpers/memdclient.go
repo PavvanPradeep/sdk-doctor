@@ -60,6 +60,9 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 		}
 	}
 
+	// The dial deadline covered connect and auth, operations from here on carry their own
+	client.conn.SetDeadline(time.Time{})
+
 	return &client, nil
 }
 
@@ -68,18 +71,17 @@ func (client *MemdClient) Close() {
 	client.conn.Close()
 }
 
-// Timing returns the per-phase timing gathered while dialing this connection.
+// Timing returns the per-phase dial timing
 func (client *MemdClient) Timing() memd.ConnectTiming {
 	return client.timing
 }
 
-// TLSState returns the negotiated TLS connection state, or nil if this
-// connection is not using TLS.
+// TLSState returns the negotiated TLS state, or nil without TLS
 func (client *MemdClient) TLSState() *tls.ConnectionState {
 	return client.tlsState
 }
 
-// SASLDuration returns how long SASL authentication took.
+// SASLDuration returns how long SASL authentication took
 func (client *MemdClient) SASLDuration() time.Duration {
 	return client.saslDuration
 }
@@ -176,9 +178,15 @@ func (client *MemdClient) selectBucket(bucket string) error {
 	return nil
 }
 
+// opTimeout bounds a single operation, as a stalled peer would otherwise block the run forever
+const opTimeout = 2000 * time.Millisecond
+
 // GetConfig will fetch a config via CCCP
 func (client *MemdClient) GetConfig() ([]byte, error) {
 	var resp memd.Response
+
+	client.conn.SetDeadline(time.Now().Add(opTimeout))
+	defer client.conn.SetDeadline(time.Time{})
 
 	err := client.conn.WritePacket(&memd.Request{
 		Magic:  memd.ReqMagic,
@@ -204,14 +212,25 @@ func (client *MemdClient) GetConfig() ([]byte, error) {
 func (client *MemdClient) Ping() error {
 	var resp memd.Response
 
-	client.conn.WritePacket(&memd.Request{
+	client.conn.SetDeadline(time.Now().Add(opTimeout))
+	defer client.conn.SetDeadline(time.Time{})
+
+	err := client.conn.WritePacket(&memd.Request{
 		Magic:  memd.ReqMagic,
 		Opcode: memd.CmdNop,
 	})
-
-	err := client.conn.ReadPacket(&resp)
 	if err != nil {
 		return err
+	}
+
+	err = client.conn.ReadPacket(&resp)
+	if err != nil {
+		return err
+	}
+
+	// An unexpected packet means the stream is no longer in step, so the timing cannot be trusted
+	if resp.Opcode != memd.CmdNop || resp.Status != memd.StatusSuccess {
+		return fmt.Errorf("unexpected nop response (opcode: %d, status: %d)", resp.Opcode, resp.Status)
 	}
 
 	return nil
