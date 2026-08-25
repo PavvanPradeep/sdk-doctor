@@ -43,6 +43,8 @@ func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
 		return
 	}
 
+	gReport.TLS = append(gReport.TLS, tlsResult{host, port, info})
+
 	gLog.Log("TLS on `%s:%d`: %s, %s, chain of %d certificate(s):",
 		host, port, info.VersionName, info.CipherName, len(info.Chain))
 
@@ -52,7 +54,7 @@ func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
 
 		// An expiring intermediate breaks the chain just as a leaf does
 		if cert.DaysToExpiry < 0 {
-			gLog.Warn(
+			gLog.Error(
 				"Certificate `%s` presented by `%s:%d` expired %d days ago (%s).",
 				cert.Subject, host, port, -cert.DaysToExpiry, cert.NotAfter.Format("2006-01-02"))
 		} else if cert.DaysToExpiry <= certExpiryWarnDays {
@@ -94,18 +96,30 @@ func logConnectPhases(host string, port int, timing memd.ConnectTiming, sasl tim
 		return
 	}
 
-	dns := "-"
+	entry := connectResult{Host: host, Port: port, TCP: dur(timing.TCP())}
 	if !timing.DNSStart.IsZero() {
-		dns = dur(timing.DNS())
+		entry.DNS = dur(timing.DNS())
 	}
-
-	phases := fmt.Sprintf("dns %s, tcp %s", dns, dur(timing.TCP()))
-
 	if !timing.TLSStart.IsZero() {
-		phases += fmt.Sprintf(", tls %s", dur(timing.TLS()))
+		entry.TLS = dur(timing.TLS())
 	}
 	if sasl > 0 {
-		phases += fmt.Sprintf(", sasl %s", dur(sasl))
+		entry.SASL = dur(sasl)
+	}
+	gReport.Connects = append(gReport.Connects, entry)
+
+	dns := entry.DNS
+	if dns == "" {
+		dns = "-"
+	}
+
+	phases := fmt.Sprintf("dns %s, tcp %s", dns, entry.TCP)
+
+	if entry.TLS != "" {
+		phases += fmt.Sprintf(", tls %s", entry.TLS)
+	}
+	if entry.SASL != "" {
+		phases += fmt.Sprintf(", sasl %s", entry.SASL)
 	}
 
 	gLog.Log("Connect phases for `%s:%d`: %s", host, port, phases)
@@ -185,6 +199,7 @@ var (
 	samplesArg        int
 	durationArg       time.Duration
 	rtoMinArg         time.Duration
+	outArg            string
 )
 
 func init() {
@@ -196,6 +211,7 @@ func init() {
 	diagnoseCmd.PersistentFlags().StringVarP(&bucketPasswordArg, "bucket-password", "z", "", "bucket password (deprecated, use password instead)")
 	diagnoseCmd.PersistentFlags().IntVar(&samplesArg, "samples", 10, "number of KV latency samples to collect per node")
 	diagnoseCmd.PersistentFlags().DurationVar(&durationArg, "duration", 0, "sample KV latency for this long per node instead of a fixed count (e.g. 60s)")
+	diagnoseCmd.PersistentFlags().StringVarP(&outArg, "out", "o", "", "write a structured JSON report of this run to this file")
 	diagnoseCmd.PersistentFlags().DurationVar(&rtoMinArg, "rto-min", helpers.DefaultRTOMin, "this client OS's minimum TCP retransmission timeout, used to tell packet loss from latency")
 }
 
@@ -238,6 +254,10 @@ func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) bool
 	for i := 0; i < samplesArg; i++ {
 		if !sampleOne() {
 			return false
+		}
+
+		if i < samplesArg-1 {
+			time.Sleep(kvSampleInterval)
 		}
 	}
 
@@ -289,9 +309,21 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 	if passwordArg == "" && bucketPasswordArg != "" {
 		passwordArg = bucketPasswordArg
 	}
+	gReport.StartedAt = time.Now()
+	gReport.ConnectionString = connStr
+
 	diagnose(connStr, usernameArg, passwordArg, tlsConfig)
 
 	gLog.Log("Diagnostics completed")
+
+	if outArg != "" {
+		if err := writeReport(outArg); err != nil {
+			gLog.Error("Failed to write the report to `%s` (error: %s)", outArg, err)
+		} else {
+			gLog.Log("Wrote a structured report of this run to `%s`", outArg)
+		}
+	}
+
 	gLog.NewLine()
 
 	gLog.PrintSummary()
@@ -333,6 +365,7 @@ type bucketConfigNodeExt struct {
 
 type terseBucketConfig struct {
 	SourceHost string
+	SourcePort int
 	UUID       string                `json:"uuid"`
 	Rev        uint                  `json:"rev"`
 	NodesExt   []bucketConfigNodeExt `json:"nodesExt"`
@@ -391,8 +424,18 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 	// Check if we connected using any of the ports associated with the default
 	// configurations that are available.
 	for _, node := range config.NodesExt {
+		// The node serving the config advertises no hostname of its own
+		hostname := node.Hostname
+		if hostname == "" {
+			hostname = config.SourceHost
+		}
+
+		if hostname != config.SourceHost {
+			continue
+		}
+
 		for _, svcPort := range node.Services {
-			if fmt.Sprintf("%s:%d", node.Hostname, svcPort) == config.SourceHost {
+			if svcPort == config.SourcePort {
 				return "default"
 			}
 		}
@@ -457,6 +500,7 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	}
 
 	config.SourceHost = host
+	config.SourcePort = port
 
 	return config, nil
 }
@@ -486,6 +530,7 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 	}
 
 	config.SourceHost = host
+	config.SourcePort = port
 
 	return config, nil
 }
@@ -542,6 +587,14 @@ func matrixPorts(nodes []clusterNode, useTLS bool) ([]portDef, map[int]bool) {
 // Windows reports refusals as WSAECONNREFUSED, which does not match syscall.ECONNREFUSED.
 const wsaeConnRefused = syscall.Errno(10061)
 
+// isConnRefused reports whether the peer answered with a refusal, which proves the
+// packets reached it and nothing was listening
+func isConnRefused(err error) bool {
+	var errno syscall.Errno
+
+	return errors.As(err, &errno) && (errno == syscall.ECONNREFUSED || errno == wsaeConnRefused)
+}
+
 func probePort(host string, port int, timeout time.Duration) string {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err == nil {
@@ -549,8 +602,7 @@ func probePort(host string, port int, timeout time.Duration) string {
 		return "open"
 	}
 
-	var errno syscall.Errno
-	if errors.As(err, &errno) && (errno == syscall.ECONNREFUSED || errno == wsaeConnRefused) {
+	if isConnRefused(err) {
 		return "refused"
 	}
 
@@ -572,9 +624,7 @@ func isDialFailure(err error) bool {
 	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
-// httpProbeUnreachable reports whether a failed HTTP service probe never reached the
-// service at all.  The client timeout cancels the whole request, so a host that drops
-// packets fails with a context deadline rather than a dial error
+// httpProbeUnreachable reports whether a failed HTTP service probe never reached the service at all; the client timeout cancels the whole request, so a host that drops packets fails with a context deadline rather than a dial error
 func httpProbeUnreachable(err error, timing memd.ConnectTiming) bool {
 	return isDialFailure(err) || timing.TCPDone.IsZero()
 }
@@ -638,6 +688,13 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 		}
 	}
 	wg.Wait()
+
+	for i, node := range nodes {
+		for j, p := range ports {
+			gReport.Ports = append(gReport.Ports,
+				portResult{node.Hostname, p.Port, p.Name, results[i][j], advertised[p.Port]})
+		}
+	}
 
 	nameWidth := len("PORT MATRIX")
 	for _, node := range nodes {
@@ -733,7 +790,51 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	}
 }
 
+// A client opens a connection per node per service, and the runtime needs headroom besides
+const minFDLimit = 1024
+
+func logHostInfo() {
+	info := helpers.GatherHostInfo()
+	gReport.Host = &info
+
+	gLog.Log("Running on %s/%s (%s)", info.OS, info.Arch, info.GoVersion)
+
+	if info.FDLimit > 0 {
+		gLog.Log("Open file limit for this process is %d", info.FDLimit)
+
+		if info.FDLimit < minFDLimit {
+			gLog.Warn(
+				"This host allows only %d open files per process.  An application holding"+
+					" connections to every node and service can exhaust that and fail with"+
+					" `too many open files` under load.",
+				info.FDLimit)
+		}
+	}
+
+	gLog.Log("Network interfaces that are up:")
+	for _, iface := range info.Interfaces {
+		if !iface.Up || len(iface.Addresses) == 0 {
+			continue
+		}
+
+		gLog.Log("  %s: mtu %d, %s", iface.Name, iface.MTU, strings.Join(iface.Addresses, ", "))
+	}
+
+	if len(info.Proxy) > 0 {
+		gLog.Warn(
+			"Proxy environment variables are set on this host (%s).  The doctor connects"+
+				" directly and ignores them, so an application whose HTTP client honours them"+
+				" reaches the cluster by a different path than the one diagnosed here.",
+			strings.Join(info.Proxy, ", "))
+	}
+}
+
 func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
+	//======================================================================
+	//  HOST ENVIRONMENT
+	//======================================================================
+	logHostInfo()
+
 	//======================================================================
 	//  CONNECTION STRING
 	//======================================================================
@@ -777,6 +878,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	}
 
 	gLog.Log("Connection string specifies bucket `%s`", resConnSpec.Bucket)
+
+	gReport.Bucket = resConnSpec.Bucket
 
 	//======================================================================
 	//  SSL
@@ -1051,6 +1154,10 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		return
 	}
 
+	gReport.Network = selectedNetwork
+	gReport.ConfigSource = configSource
+	gReport.Nodes = nodesList
+
 	gLog.Log("Identified the following nodes:")
 	for i, target := range nodesList {
 		gLog.Log("  [%d] %s", i, target.Hostname)
@@ -1142,6 +1249,9 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 						direction = "behind"
 					}
 
+					gReport.ClockSkew = fmt.Sprintf("%s %s the cluster",
+						skew.Round(time.Second), direction)
+
 					if skew < 2*time.Second {
 						gLog.Log("Local clock is in sync with node `%s`", infoSourceHost)
 					} else {
@@ -1175,7 +1285,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	//======================================================================
 	//  SERVICES
 	//======================================================================
-	var svcOk, svcFailed, svcUnreachable int
+	var svcOk, svcFailed, svcUnreachable, svcRefused int
 
 	// One cert covers every service on a node
 	tlsReported := map[string]bool{}
@@ -1200,7 +1310,9 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
 				svcFailed++
-				if isDialFailure(err) {
+				if isConnRefused(err) {
+					svcRefused++
+				} else if isDialFailure(err) {
 					svcUnreachable++
 				} else if tlsConfig != nil && !tlsReported[node.Hostname] {
 					tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)
@@ -1240,7 +1352,9 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			resp, err := testHTTPClient.Do(req)
 			if err != nil {
 				svcFailed++
-				if httpProbeUnreachable(err, phases()) {
+				if isConnRefused(err) {
+					svcRefused++
+				} else if httpProbeUnreachable(err, phases()) {
 					svcUnreachable++
 				} else if tlsConfig != nil && !tlsReported[node.Hostname] {
 					tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)
@@ -1286,7 +1400,14 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				" resolve or route from here.  Configure alternate addresses on the cluster so"+
 				" it advertises externally reachable hostnames to clients like this one.",
 			svcFailed, selectedNetwork)
-	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 {
+	} else if svcOk == 0 && svcFailed > 0 && svcRefused == svcFailed {
+		gLog.Error(
+			"Bootstrap succeeded but every one of the %d advertised service endpoints refused"+
+				" the connection.  The nodes are reachable and answered, so this is not a network"+
+				" problem: the services are not running, or they are not listening on the ports"+
+				" the cluster advertises on the `%s` network.",
+			svcFailed, selectedNetwork)
+	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 && svcRefused == 0 {
 		gLog.Error(
 			"Bootstrap succeeded and every one of the %d advertised service endpoints accepted"+
 				" the connection, but none of them completed it.  The network path is fine, so"+
@@ -1366,7 +1487,20 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				stats.Count(), stats.Errors(),
 				latencies, dur(stats.Max()), dur(stats.StdDev()))
 
-			if suspects := helpers.RTOSuspects(stats.Samples(), rtoMinArg); len(suspects) > 0 {
+			suspects := helpers.RTOSuspects(stats.Samples(), rtoMinArg)
+
+			gReport.Latency = append(gReport.Latency, latencyResult{
+				Host: node.Hostname, Port: kvPort,
+				Samples: stats.Count(), Errors: stats.Errors(),
+				FirstOp: dur(firstOpDuration),
+				Min:     dur(stats.Min()), Mean: dur(stats.Mean()),
+				P50: dur(stats.Percentile(50)), P90: dur(stats.Percentile(90)),
+				P99: dur(stats.Percentile(99)), Max: dur(stats.Max()),
+				StdDev:      dur(stats.StdDev()),
+				RTOSuspects: durs(suspects),
+			})
+
+			if len(suspects) > 0 {
 				gLog.Error(
 					"%d of %d samples on `%s:%d` landed on a TCP retransmission timeout"+
 						" multiple (slowest: %s).  This is the signature of packet loss on"+

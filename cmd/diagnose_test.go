@@ -93,7 +93,6 @@ func TestScanPortMatrixWarnsOnceForRefusedClientPorts(t *testing.T) {
 	openPort, closeOpen := bindPort()
 	defer closeOpen()
 
-	// Releasing the listener leaves a port that refuses rather than one that is filtered
 	mgmtPort, closeMgmt := bindPort()
 	closeMgmt()
 	n1qlPort, closeN1ql := bindPort()
@@ -112,7 +111,6 @@ func TestScanPortMatrixWarnsOnceForRefusedClientPorts(t *testing.T) {
 		},
 	}}, false)
 
-	// Two refused client ports on one host are one operator problem, so they warn once
 	if warns := strings.Count(out.String(), "Cluster advertises"); warns != 1 {
 		t.Fatalf("expected a single aggregated warning, got %d:\n%s", warns, out.String())
 	}
@@ -202,7 +200,6 @@ func TestIsDialFailure(t *testing.T) {
 		t.Fatalf("a refused http dial is a dial failure, got %v", httpErr)
 	}
 
-	// An untrusted certificate must not be mistaken for an unreachable network
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer srv.Close()
 
@@ -226,20 +223,15 @@ func TestHTTPProbeUnreachable(t *testing.T) {
 		Err: context.DeadlineExceeded,
 	}
 
-	// A host dropping packets never completes the handshake, so the client timeout
-	// fires with the TCP phase still open
 	if !httpProbeUnreachable(stalled, memd.ConnectTiming{TCPStart: time.Now()}) {
 		t.Fatal("a timeout before the handshake completed is unreachable")
 	}
 
-	// The same error from a service that accepted the connection and then stopped
-	// answering is a stalled service, not an unroutable network
 	connected := memd.ConnectTiming{TCPStart: time.Now(), TCPDone: time.Now()}
 	if httpProbeUnreachable(stalled, connected) {
 		t.Fatal("a timeout after the handshake completed is not unreachable")
 	}
 
-	// A refusal completes the TCP phase with an error, and stays a dial failure
 	refused := &url.Error{
 		Op:  "Get",
 		URL: "http://127.0.0.1:1/",
@@ -293,7 +285,6 @@ func TestScanPortMatrixReportsBothRefusalDiagnoses(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 	openPort, _ := strconv.Atoi(portStr)
 
-	// The v6 loopback is a distinct address, so a v4-only listener is refused there
 	if probePort("::1", openPort, time.Second) != "refused" {
 		t.Skip("no usable IPv6 loopback to contrast against")
 	}
@@ -311,5 +302,94 @@ func TestScanPortMatrixReportsBothRefusalDiagnoses(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("expected `%s` in the output:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestNetworkFromTerseBucketConfig(t *testing.T) {
+	node := func(hostname string, alternate bool) bucketConfigNodeExt {
+		ext := bucketConfigNodeExt{
+			ThisNode: true,
+			Hostname: hostname,
+			Services: map[string]int{"kv": 11210, "mgmt": 8091},
+		}
+
+		if alternate {
+			ext.AlternateNames = map[string]bucketConfigAlternateNames{
+				"external": {Hostname: "node1.example.com", Ports: map[string]int{"kv": 32100}},
+			}
+		}
+
+		return ext
+	}
+
+	tests := []struct {
+		name   string
+		config terseBucketConfig
+		want   string
+	}{
+		{
+			// The alternate addresses exist, but this client reached the node on its own network
+			name: "bootstrapped on a default port",
+			config: terseBucketConfig{
+				SourceHost: "node1.internal", SourcePort: 11210,
+				NodesExt: []bucketConfigNodeExt{node("node1.internal", true)},
+			},
+			want: "default",
+		},
+		{
+			name: "bootstrapped on an alternate port",
+			config: terseBucketConfig{
+				SourceHost: "node1.example.com", SourcePort: 32100,
+				NodesExt: []bucketConfigNodeExt{node("node1.internal", true)},
+			},
+			want: "external",
+		},
+		{
+			// Couchbase omits the hostname of the node answering the request
+			name: "node advertises no hostname",
+			config: terseBucketConfig{
+				SourceHost: "node1.internal", SourcePort: 8091,
+				NodesExt: []bucketConfigNodeExt{node("", true)},
+			},
+			want: "default",
+		},
+		{
+			name: "no alternate addresses configured",
+			config: terseBucketConfig{
+				SourceHost: "node1.internal", SourcePort: 11210,
+				NodesExt: []bucketConfigNodeExt{node("node1.internal", false)},
+			},
+			want: "default",
+		},
+	}
+
+	for _, test := range tests {
+		if got := networkFromTerseBucketConfig(test.config); got != test.want {
+			t.Errorf("%s: expected `%s`, got `%s`", test.name, test.want, got)
+		}
+	}
+}
+
+func TestIsConnRefused(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+
+	addr := ln.Addr().String()
+	ln.Close()
+
+	_, refusedErr := net.DialTimeout("tcp", addr, time.Second)
+	if refusedErr == nil {
+		t.Skip("the released port was taken by another listener")
+	}
+
+	if !isConnRefused(refusedErr) {
+		t.Fatalf("expected a refusal for %s, got %v", addr, refusedErr)
+	}
+
+	_, dnsErr := net.DialTimeout("tcp", "no-such-host.invalid:80", time.Second)
+	if dnsErr == nil || isConnRefused(dnsErr) {
+		t.Fatalf("expected a lookup failure to not be a refusal, got %v", dnsErr)
 	}
 }

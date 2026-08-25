@@ -9,18 +9,21 @@ import (
 	"github.com/fatih/color"
 )
 
-// Logger provides aggregated logging
-type Logger struct {
-	out    io.Writer
-	warns  []string
-	errors []string
+// LogEntry is a single emitted log line
+type LogEntry struct {
+	Time    time.Time
+	Level   string
+	Message string
 }
 
-func timeLogStr() string {
-	t := time.Now()
-	return fmt.Sprintf("%02d:%02d:%02d.%03d",
-		t.Hour(), t.Minute(), t.Second(), t.Nanosecond()/int(time.Millisecond))
+// Logger provides aggregated logging
+type Logger struct {
+	out     io.Writer
+	entries []LogEntry
 }
+
+// timeFormat is RFC3339 with milliseconds, so lines correlate against cluster logs
+const timeFormat = "2006-01-02T15:04:05.000Z07:00"
 
 // SetOutput redirects the log, which writes to stdout by default
 func (l *Logger) SetOutput(w io.Writer) {
@@ -35,29 +38,51 @@ func (l *Logger) writer() io.Writer {
 	return l.out
 }
 
-// NewLine adds a new line to the log
+func (l *Logger) Entries() []LogEntry {
+	return l.entries
+}
+
+
 func (l *Logger) NewLine() {
 	fmt.Fprintf(l.writer(), "\n")
 }
 
+func (l *Logger) write(level, format string, args ...interface{}) {
+	entry := LogEntry{
+		Time:    time.Now(),
+		Level:   level,
+		Message: fmt.Sprintf(format, args...),
+	}
+	l.entries = append(l.entries, entry)
+
+	fmt.Fprintf(l.writer(), "%s %s ▶ %s\n",
+		entry.Time.Format(timeFormat), entry.Level, entry.Message)
+}
+
 // Log writes to the log at INFO level
 func (l *Logger) Log(format string, args ...interface{}) {
-	line := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.writer(), "%s INFO ▶ %s\n", timeLogStr(), line)
+	l.write("INFO", format, args...)
 }
 
 // Warn writes to the log at WARN level
 func (l *Logger) Warn(format string, args ...interface{}) {
-	line := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.writer(), "%s WARN ▶ %s\n", timeLogStr(), line)
-	l.warns = append(l.warns, line)
+	l.write("WARN", format, args...)
 }
 
 // Error writes to the log at ERROR level
 func (l *Logger) Error(format string, args ...interface{}) {
-	line := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.writer(), "%s ERRO ▶ %s\n", timeLogStr(), line)
-	l.errors = append(l.errors, line)
+	l.write("ERRO", format, args...)
+}
+
+func (l Logger) linesAt(level string) []string {
+	var out []string
+	for _, entry := range l.entries {
+		if entry.Level == level {
+			out = append(out, entry.Message)
+		}
+	}
+
+	return out
 }
 
 // PrintSummary prints a summary of the emitted logs
@@ -66,15 +91,18 @@ func (l Logger) PrintSummary() {
 
 	fmt.Fprintf(out, "Summary:\n")
 
-	for _, line := range l.warns {
+	warns := l.linesAt("WARN")
+	errors := l.linesAt("ERRO")
+
+	for _, line := range warns {
 		fmt.Fprintf(out, "%s %s\n", color.YellowString("[WARN]"), line)
 	}
-	for _, line := range l.errors {
+	for _, line := range errors {
 		fmt.Fprintf(out, "%s %s\n", color.RedString("[ERRO]"), line)
 	}
 
 	fmt.Fprintf(out, "\n")
-	if len(l.warns) > 0 || len(l.errors) > 0 {
+	if len(warns) > 0 || len(errors) > 0 {
 		fmt.Fprintf(out, "Found multiple issues, see listing above.\n")
 	} else {
 		fmt.Fprintf(out, "Nothing of importance to note!  Nice job!\n")
