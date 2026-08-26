@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 )
 
 type NetInterface struct {
@@ -30,7 +31,14 @@ var proxyVars = []string{
 }
 
 func redactProxy(value string) string {
-	parsed, err := url.Parse(value)
+	// url.Parse misreads a scheme-less "user:pass@host:port" as scheme "user", so add one
+	toParse := value
+	schemeAdded := !strings.Contains(value, "://")
+	if schemeAdded {
+		toParse = "redact://" + value
+	}
+
+	parsed, err := url.Parse(toParse)
 	if err != nil || parsed.User == nil {
 		return value
 	}
@@ -41,7 +49,12 @@ func redactProxy(value string) string {
 
 	parsed.User = url.UserPassword(parsed.User.Username(), "xxxxx")
 
-	return parsed.String()
+	result := parsed.String()
+	if schemeAdded {
+		result = strings.TrimPrefix(result, "redact://")
+	}
+
+	return result
 }
 
 func GatherHostInfo() HostInfo {

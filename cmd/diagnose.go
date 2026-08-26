@@ -219,8 +219,11 @@ const kvSampleInterval = 100 * time.Millisecond
 const kvMaxErrorStreak = 10
 
 // sampleKVLatency returns false if it gave up early on a connection that kept failing
-func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) bool {
-	var errStreak int
+func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper, firstOpFailed bool) bool {
+	errStreak := 0
+	if firstOpFailed {
+		errStreak = 1
+	}
 
 	// Returns false once the connection has failed often enough to stop sampling it
 	sampleOne := func() bool {
@@ -421,29 +424,41 @@ func clusterNodesFromTerseBucketConfig(config terseBucketConfig, networkType str
 }
 
 func networkFromTerseBucketConfig(config terseBucketConfig) string {
+	thisNode := config.GetSourceNodeExt()
+	if thisNode == nil {
+		return "default"
+	}
+
 	// Check if we connected using any of the ports associated with the default
 	// configurations that are available.
-	for _, node := range config.NodesExt {
+	hostname := thisNode.Hostname
+	if hostname == "" {
 		// The node serving the config advertises no hostname of its own
-		hostname := node.Hostname
-		if hostname == "" {
-			hostname = config.SourceHost
-		}
+		hostname = config.SourceHost
+	}
 
-		if hostname != config.SourceHost {
-			continue
-		}
-
-		for _, svcPort := range node.Services {
+	if hostname == config.SourceHost {
+		for _, svcPort := range thisNode.Services {
 			if svcPort == config.SourcePort {
 				return "default"
 			}
 		}
 	}
 
-	for _, node := range config.NodesExt {
-		if _, found := node.AlternateNames["external"]; found {
-			return "external"
+	for networkType, netInfo := range thisNode.AlternateNames {
+		if netInfo.Hostname != config.SourceHost {
+			continue
+		}
+
+		ports := netInfo.Ports
+		if ports == nil {
+			ports = thisNode.Services
+		}
+
+		for _, svcPort := range ports {
+			if svcPort == config.SourcePort {
+				return networkType
+			}
 		}
 	}
 
@@ -1458,7 +1473,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			}
 
 			var stats helpers.PingHelper
-			if !sampleKVLatency(client, &stats) {
+			if !sampleKVLatency(client, &stats, firstOpErr != nil) {
 				gLog.Error(
 					"Sampling of `%s:%d` stopped early after %d consecutive failed pings, the"+
 						" connection did not survive the run.",
