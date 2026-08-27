@@ -1564,6 +1564,22 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 					tailName, allowedMaxMs, dur(tail))
 			}
 
+			if counters, ok := client.TCPCounters(); ok {
+				gLog.Log(
+					"TCP counters for `%s:%d`: rtt %s, rttvar %s, cwnd %d, retransmits %d, lost %d",
+					node.Hostname, kvPort,
+					dur(counters.RTT), dur(counters.RTTVar),
+					counters.CongestionWindow, counters.TotalRetransmits, counters.Lost)
+
+				gReport.TCPCounters = append(gReport.TCPCounters, tcpCountersResult{
+					Host: node.Hostname, Port: kvPort,
+					RTT: dur(counters.RTT), RTTVar: dur(counters.RTTVar),
+					CongestionWindow: counters.CongestionWindow,
+					TotalRetransmits: counters.TotalRetransmits,
+					Lost:             counters.Lost,
+				})
+			}
+
 			if idleTestArg > 0 && sampleSurvived {
 				gLog.Log("Idling `%s:%d` for %s to test for connection reaping...",
 					node.Hostname, kvPort, dur(idleTestArg))

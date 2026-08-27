@@ -55,21 +55,32 @@ type idleTestResult struct {
 	Error     string `json:",omitempty"`
 }
 
+type tcpCountersResult struct {
+	Host             string
+	Port             int
+	RTT              string
+	RTTVar           string
+	CongestionWindow uint32
+	TotalRetransmits uint32
+	Lost             uint32
+}
+
 type diagnosticReport struct {
 	StartedAt        time.Time
 	FinishedAt       time.Time
 	ConnectionString string
-	Host             *helpers.HostInfo `json:",omitempty"`
-	Bucket           string            `json:",omitempty"`
-	Network          string            `json:",omitempty"`
-	ConfigSource     string            `json:",omitempty"`
-	ClockSkew        string            `json:",omitempty"`
-	Nodes            []clusterNode     `json:",omitempty"`
-	Ports            []portResult      `json:",omitempty"`
-	Connects         []connectResult   `json:",omitempty"`
-	Latency          []latencyResult   `json:",omitempty"`
-	TLS              []tlsResult       `json:",omitempty"`
-	IdleTest         []idleTestResult  `json:",omitempty"`
+	Host             *helpers.HostInfo   `json:",omitempty"`
+	Bucket           string              `json:",omitempty"`
+	Network          string              `json:",omitempty"`
+	ConfigSource     string              `json:",omitempty"`
+	ClockSkew        string              `json:",omitempty"`
+	Nodes            []clusterNode       `json:",omitempty"`
+	Ports            []portResult        `json:",omitempty"`
+	Connects         []connectResult     `json:",omitempty"`
+	Latency          []latencyResult     `json:",omitempty"`
+	TLS              []tlsResult         `json:",omitempty"`
+	IdleTest         []idleTestResult    `json:",omitempty"`
+	TCPCounters      []tcpCountersResult `json:",omitempty"`
 	Log              []helpers.LogEntry
 }
 
