@@ -47,6 +47,14 @@ type tlsResult struct {
 	helpers.TLSChainInfo
 }
 
+type idleTestResult struct {
+	Host      string
+	Port      int
+	IdleFor   string
+	ReplyTime string `json:",omitempty"`
+	Error     string `json:",omitempty"`
+}
+
 type diagnosticReport struct {
 	StartedAt        time.Time
 	FinishedAt       time.Time
@@ -61,6 +69,7 @@ type diagnosticReport struct {
 	Connects         []connectResult   `json:",omitempty"`
 	Latency          []latencyResult   `json:",omitempty"`
 	TLS              []tlsResult       `json:",omitempty"`
+	IdleTest         []idleTestResult  `json:",omitempty"`
 	Log              []helpers.LogEntry
 }
 

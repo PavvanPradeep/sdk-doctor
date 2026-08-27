@@ -200,6 +200,7 @@ var (
 	durationArg       time.Duration
 	rtoMinArg         time.Duration
 	outArg            string
+	idleTestArg       time.Duration
 )
 
 func init() {
@@ -213,6 +214,7 @@ func init() {
 	diagnoseCmd.PersistentFlags().DurationVar(&durationArg, "duration", 0, "sample KV latency for this long per node instead of a fixed count (e.g. 60s)")
 	diagnoseCmd.PersistentFlags().StringVarP(&outArg, "out", "o", "", "write a structured JSON report of this run to this file")
 	diagnoseCmd.PersistentFlags().DurationVar(&rtoMinArg, "rto-min", helpers.DefaultRTOMin, "this client OS's minimum TCP retransmission timeout, used to tell packet loss from latency")
+	diagnoseCmd.PersistentFlags().DurationVar(&idleTestArg, "idle-test", 0, "after sampling, idle each node's KV connection this long then NOOP it, to catch idle connections being dropped (e.g. 5m)")
 }
 
 const kvSampleInterval = 100 * time.Millisecond
@@ -265,6 +267,17 @@ func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper, firs
 	}
 
 	return true
+}
+
+// idleTest idles a connection for idleTestArg then NOOPs it, to catch a stateful firewall
+// or load balancer silently dropping idle connections
+func idleTest(client *helpers.MemdClient) (time.Duration, error) {
+	time.Sleep(idleTestArg)
+
+	start := time.Now()
+	err := client.Ping()
+
+	return time.Since(start), err
 }
 
 var gLog helpers.Logger
@@ -1473,7 +1486,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			}
 
 			var stats helpers.PingHelper
-			if !sampleKVLatency(client, &stats, firstOpErr != nil) {
+			sampleSurvived := sampleKVLatency(client, &stats, firstOpErr != nil)
+			if !sampleSurvived {
 				gLog.Error(
 					"Sampling of `%s:%d` stopped early after %d consecutive failed pings, the"+
 						" connection did not survive the run.",
@@ -1548,6 +1562,30 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 						" affect application performance.",
 					node.Hostname, kvPort,
 					tailName, allowedMaxMs, dur(tail))
+			}
+
+			if idleTestArg > 0 && sampleSurvived {
+				gLog.Log("Idling `%s:%d` for %s to test for connection reaping...",
+					node.Hostname, kvPort, dur(idleTestArg))
+
+				replyTime, err := idleTest(client)
+
+				result := idleTestResult{Host: node.Hostname, Port: kvPort, IdleFor: dur(idleTestArg)}
+
+				if err != nil {
+					result.Error = err.Error()
+					gLog.Error(
+						"Connection to `%s:%d` did not survive %s idle (error: %s), which is"+
+							" consistent with a stateful firewall or load balancer dropping idle"+
+							" connections.",
+						node.Hostname, kvPort, dur(idleTestArg), err)
+				} else {
+					result.ReplyTime = dur(replyTime)
+					gLog.Log("Connection to `%s:%d` survived %s idle, NOOP replied in %s",
+						node.Hostname, kvPort, dur(idleTestArg), dur(replyTime))
+				}
+
+				gReport.IdleTest = append(gReport.IdleTest, result)
 			}
 
 			client.Close()
