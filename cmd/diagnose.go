@@ -201,6 +201,9 @@ var (
 	rtoMinArg         time.Duration
 	outArg            string
 	idleTestArg       time.Duration
+	watchArg          time.Duration
+	watchIntervalArg  time.Duration
+	watchOutArg       string
 )
 
 func init() {
@@ -215,6 +218,9 @@ func init() {
 	diagnoseCmd.PersistentFlags().StringVarP(&outArg, "out", "o", "", "write a structured JSON report of this run to this file")
 	diagnoseCmd.PersistentFlags().DurationVar(&rtoMinArg, "rto-min", helpers.DefaultRTOMin, "this client OS's minimum TCP retransmission timeout, used to tell packet loss from latency")
 	diagnoseCmd.PersistentFlags().DurationVar(&idleTestArg, "idle-test", 0, "after sampling, idle each node's KV connection this long then NOOP it, to catch idle connections being dropped (e.g. 5m)")
+	diagnoseCmd.PersistentFlags().DurationVar(&watchArg, "watch", 0, "after the scan, keep sampling each node's KV connection for this long and write a CSV of the results (e.g. 8h), requires --watch-out")
+	diagnoseCmd.PersistentFlags().DurationVar(&watchIntervalArg, "interval", 30*time.Second, "how often to sample during --watch")
+	diagnoseCmd.PersistentFlags().StringVar(&watchOutArg, "watch-out", "", "write the --watch CSV to this file")
 }
 
 const kvSampleInterval = 100 * time.Millisecond
@@ -297,6 +303,16 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 
 	if durationArg > 0 && cmd.Flags().Changed("samples") {
 		gLog.Warn("Both --duration and --samples were specified, --samples is ignored")
+	}
+
+	if watchArg > 0 && watchOutArg == "" {
+		gLog.Error("--watch requires --watch-out, to name the CSV file the results are written to")
+		return nil
+	}
+
+	if watchArg > 0 && watchIntervalArg <= 0 {
+		gLog.Error("--interval must be positive")
+		return nil
 	}
 
 	var connStr string
@@ -1449,6 +1465,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	//======================================================================
 	//  CONNECTION PERFORMANCE
 	//======================================================================
+	var watchTargets []watchTarget
+
 	for _, node := range nodesList {
 		kvPort := node.Services["kv"]
 		if tlsConfig != nil {
@@ -1604,7 +1622,19 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				gReport.IdleTest = append(gReport.IdleTest, result)
 			}
 
-			client.Close()
+			if watchArg > 0 {
+				watchTargets = append(watchTargets, watchTarget{Host: node.Hostname, Port: kvPort, Client: client})
+			} else {
+				client.Close()
+			}
 		}
+	}
+
+	if watchArg > 0 {
+		runWatch(watchTargets, watchOutArg, watchArg, watchIntervalArg)
+	}
+
+	for _, target := range watchTargets {
+		target.Client.Close()
 	}
 }
