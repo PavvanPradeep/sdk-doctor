@@ -1509,6 +1509,24 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 					node.Hostname, kvPort, kvMaxErrorStreak)
 			}
 
+			// Read before the possible early exit below, as a failing connection is exactly
+			// when retransmit/loss counts are most useful for explaining why
+			if counters, ok := client.TCPCounters(); ok {
+				gLog.Log(
+					"TCP counters for `%s:%d`: rtt %s, rttvar %s, cwnd %d, retransmits %d, lost %d",
+					node.Hostname, kvPort,
+					dur(counters.RTT), dur(counters.RTTVar),
+					counters.CongestionWindow, counters.TotalRetransmits, counters.Lost)
+
+				gReport.TCPCounters = append(gReport.TCPCounters, tcpCountersResult{
+					Host: node.Hostname, Port: kvPort,
+					RTT: dur(counters.RTT), RTTVar: dur(counters.RTTVar),
+					CongestionWindow: counters.CongestionWindow,
+					TotalRetransmits: counters.TotalRetransmits,
+					Lost:             counters.Lost,
+				})
+			}
+
 			if stats.Successes() == 0 {
 				gLog.Error("All %d pings to `%s:%d` failed, no latency statistics are available",
 					stats.Count(), node.Hostname, kvPort)
@@ -1577,22 +1595,6 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 						" affect application performance.",
 					node.Hostname, kvPort,
 					tailName, allowedMaxMs, dur(tail))
-			}
-
-			if counters, ok := client.TCPCounters(); ok {
-				gLog.Log(
-					"TCP counters for `%s:%d`: rtt %s, rttvar %s, cwnd %d, retransmits %d, lost %d",
-					node.Hostname, kvPort,
-					dur(counters.RTT), dur(counters.RTTVar),
-					counters.CongestionWindow, counters.TotalRetransmits, counters.Lost)
-
-				gReport.TCPCounters = append(gReport.TCPCounters, tcpCountersResult{
-					Host: node.Hostname, Port: kvPort,
-					RTT: dur(counters.RTT), RTTVar: dur(counters.RTTVar),
-					CongestionWindow: counters.CongestionWindow,
-					TotalRetransmits: counters.TotalRetransmits,
-					Lost:             counters.Lost,
-				})
 			}
 
 			if idleTestArg > 0 && sampleSurvived {
