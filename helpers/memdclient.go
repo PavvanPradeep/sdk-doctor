@@ -86,6 +86,11 @@ func (client *MemdClient) SASLDuration() time.Duration {
 	return client.saslDuration
 }
 
+// TCPCounters returns the kernel's TCP statistics for this connection, where supported
+func (client *MemdClient) TCPCounters() (TCPCounters, bool) {
+	return tcpCounters(client.conn.RawConn())
+}
+
 func (client *MemdClient) auth(user, pass string) error {
 	var resp memd.Response
 

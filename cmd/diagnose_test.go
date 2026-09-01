@@ -361,11 +361,50 @@ func TestNetworkFromTerseBucketConfig(t *testing.T) {
 			},
 			want: "default",
 		},
+		{
+			// An alternate network can remap only the port, advertising no hostname of its own
+			name: "bootstrapped on an alternate port with no alternate hostname",
+			config: terseBucketConfig{
+				SourceHost: "node1.internal", SourcePort: 32100,
+				NodesExt: []bucketConfigNodeExt{{
+					ThisNode: true,
+					Hostname: "node1.internal",
+					Services: map[string]int{"kv": 11210, "mgmt": 8091},
+					AlternateNames: map[string]bucketConfigAlternateNames{
+						"external": {Ports: map[string]int{"kv": 32100}},
+					},
+				}},
+			},
+			want: "external",
+		},
 	}
 
 	for _, test := range tests {
 		if got := networkFromTerseBucketConfig(test.config); got != test.want {
 			t.Errorf("%s: expected `%s`, got `%s`", test.name, test.want, got)
+		}
+	}
+}
+
+func TestNetworkFromTerseBucketConfigIsDeterministic(t *testing.T) {
+	config := terseBucketConfig{
+		SourceHost: "node1.example.com", SourcePort: 32100,
+		NodesExt: []bucketConfigNodeExt{{
+			ThisNode: true,
+			Hostname: "node1.internal",
+			Services: map[string]int{"kv": 11210},
+			AlternateNames: map[string]bucketConfigAlternateNames{
+				"external":  {Hostname: "node1.example.com", Ports: map[string]int{"kv": 32100}},
+				"external2": {Hostname: "node1.example.com", Ports: map[string]int{"kv": 32100}},
+			},
+		}},
+	}
+
+	// Map iteration order is randomized per range, so a run without sorted keys would be
+	// unlikely to return the same network every time across enough repetitions
+	for i := 0; i < 20; i++ {
+		if got := networkFromTerseBucketConfig(config); got != "external" {
+			t.Fatalf("run %d: expected the alphabetically-first match `external`, got `%s`", i, got)
 		}
 	}
 }

@@ -15,6 +15,8 @@ func TestRedactProxy(t *testing.T) {
 		{"http://user@proxy.corp:3128", "http://user@proxy.corp:3128"},
 		{"http://user:hunter2@proxy.corp:3128", "http://user:xxxxx@proxy.corp:3128"},
 		{"localhost,127.0.0.1", "localhost,127.0.0.1"},
+		{"user:hunter2@proxy.corp:3128", "user:xxxxx@proxy.corp:3128"},
+		{"user:hunter2@proxy.corp:3128/path?next=http://internal", "user:xxxxx@proxy.corp:3128/path?next=http://internal"},
 	}
 
 	for _, test := range tests {

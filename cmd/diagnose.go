@@ -200,6 +200,7 @@ var (
 	durationArg       time.Duration
 	rtoMinArg         time.Duration
 	outArg            string
+	idleTestArg       time.Duration
 )
 
 func init() {
@@ -213,14 +214,18 @@ func init() {
 	diagnoseCmd.PersistentFlags().DurationVar(&durationArg, "duration", 0, "sample KV latency for this long per node instead of a fixed count (e.g. 60s)")
 	diagnoseCmd.PersistentFlags().StringVarP(&outArg, "out", "o", "", "write a structured JSON report of this run to this file")
 	diagnoseCmd.PersistentFlags().DurationVar(&rtoMinArg, "rto-min", helpers.DefaultRTOMin, "this client OS's minimum TCP retransmission timeout, used to tell packet loss from latency")
+	diagnoseCmd.PersistentFlags().DurationVar(&idleTestArg, "idle-test", 0, "after sampling, idle each node's KV connection this long then NOOP it, to catch idle connections being dropped (e.g. 5m)")
 }
 
 const kvSampleInterval = 100 * time.Millisecond
 const kvMaxErrorStreak = 10
 
 // sampleKVLatency returns false if it gave up early on a connection that kept failing
-func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) bool {
-	var errStreak int
+func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper, firstOpFailed bool) bool {
+	errStreak := 0
+	if firstOpFailed {
+		errStreak = 1
+	}
 
 	// Returns false once the connection has failed often enough to stop sampling it
 	sampleOne := func() bool {
@@ -262,6 +267,17 @@ func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper) bool
 	}
 
 	return true
+}
+
+// idleTest idles a connection for idleTestArg then NOOPs it, to catch a stateful firewall
+// or load balancer silently dropping idle connections
+func idleTest(client *helpers.MemdClient) (time.Duration, error) {
+	time.Sleep(idleTestArg)
+
+	start := time.Now()
+	err := client.Ping()
+
+	return time.Since(start), err
 }
 
 var gLog helpers.Logger
@@ -421,29 +437,56 @@ func clusterNodesFromTerseBucketConfig(config terseBucketConfig, networkType str
 }
 
 func networkFromTerseBucketConfig(config terseBucketConfig) string {
+	thisNode := config.GetSourceNodeExt()
+	if thisNode == nil {
+		return "default"
+	}
+
 	// Check if we connected using any of the ports associated with the default
 	// configurations that are available.
-	for _, node := range config.NodesExt {
+	hostname := thisNode.Hostname
+	if hostname == "" {
 		// The node serving the config advertises no hostname of its own
-		hostname := node.Hostname
-		if hostname == "" {
-			hostname = config.SourceHost
-		}
+		hostname = config.SourceHost
+	}
 
-		if hostname != config.SourceHost {
-			continue
-		}
-
-		for _, svcPort := range node.Services {
+	if hostname == config.SourceHost {
+		for _, svcPort := range thisNode.Services {
 			if svcPort == config.SourcePort {
 				return "default"
 			}
 		}
 	}
 
-	for _, node := range config.NodesExt {
-		if _, found := node.AlternateNames["external"]; found {
-			return "external"
+	// Sorted for a deterministic result if more than one alternate network matches
+	networkTypes := make([]string, 0, len(thisNode.AlternateNames))
+	for networkType := range thisNode.AlternateNames {
+		networkTypes = append(networkTypes, networkType)
+	}
+	sort.Strings(networkTypes)
+
+	for _, networkType := range networkTypes {
+		netInfo := thisNode.AlternateNames[networkType]
+
+		// A network that only remaps the port advertises no hostname of its own
+		altHostname := netInfo.Hostname
+		if altHostname == "" {
+			altHostname = hostname
+		}
+
+		if altHostname != config.SourceHost {
+			continue
+		}
+
+		ports := netInfo.Ports
+		if ports == nil {
+			ports = thisNode.Services
+		}
+
+		for _, svcPort := range ports {
+			if svcPort == config.SourcePort {
+				return networkType
+			}
 		}
 	}
 
@@ -1458,11 +1501,30 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			}
 
 			var stats helpers.PingHelper
-			if !sampleKVLatency(client, &stats) {
+			sampleSurvived := sampleKVLatency(client, &stats, firstOpErr != nil)
+			if !sampleSurvived {
 				gLog.Error(
 					"Sampling of `%s:%d` stopped early after %d consecutive failed pings, the"+
 						" connection did not survive the run.",
 					node.Hostname, kvPort, kvMaxErrorStreak)
+			}
+
+			// Read before the possible early exit below, as a failing connection is exactly
+			// when retransmit/loss counts are most useful for explaining why
+			if counters, ok := client.TCPCounters(); ok {
+				gLog.Log(
+					"TCP counters for `%s:%d`: rtt %s, rttvar %s, cwnd %d, retransmits %d, lost %d",
+					node.Hostname, kvPort,
+					dur(counters.RTT), dur(counters.RTTVar),
+					counters.CongestionWindow, counters.TotalRetransmits, counters.Lost)
+
+				gReport.TCPCounters = append(gReport.TCPCounters, tcpCountersResult{
+					Host: node.Hostname, Port: kvPort,
+					RTT: dur(counters.RTT), RTTVar: dur(counters.RTTVar),
+					CongestionWindow: counters.CongestionWindow,
+					TotalRetransmits: counters.TotalRetransmits,
+					Lost:             counters.Lost,
+				})
 			}
 
 			if stats.Successes() == 0 {
@@ -1533,6 +1595,30 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 						" affect application performance.",
 					node.Hostname, kvPort,
 					tailName, allowedMaxMs, dur(tail))
+			}
+
+			if idleTestArg > 0 && sampleSurvived {
+				gLog.Log("Idling `%s:%d` for %s to test for connection reaping...",
+					node.Hostname, kvPort, dur(idleTestArg))
+
+				replyTime, err := idleTest(client)
+
+				result := idleTestResult{Host: node.Hostname, Port: kvPort, IdleFor: dur(idleTestArg)}
+
+				if err != nil {
+					result.Error = err.Error()
+					gLog.Error(
+						"Connection to `%s:%d` did not survive %s idle (error: %s), which is"+
+							" consistent with a stateful firewall or load balancer dropping idle"+
+							" connections.",
+						node.Hostname, kvPort, dur(idleTestArg), err)
+				} else {
+					result.ReplyTime = dur(replyTime)
+					gLog.Log("Connection to `%s:%d` survived %s idle, NOOP replied in %s",
+						node.Hostname, kvPort, dur(idleTestArg), dur(replyTime))
+				}
+
+				gReport.IdleTest = append(gReport.IdleTest, result)
 			}
 
 			client.Close()

@@ -47,6 +47,7 @@ type ReadWriteCloser interface {
 	ReadPacket(*Response) error
 	SetDeadline(time.Time) error
 	Close() error
+	RawConn() net.Conn
 }
 
 // ConnectTiming records each dial phase; the TLS fields stay zero without TLS
@@ -188,6 +189,12 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 
 func (s *memdConn) Close() error {
 	return s.conn.Close()
+}
+
+// RawConn returns the underlying net.Conn, TLS-wrapped or not
+func (s *memdConn) RawConn() net.Conn {
+	conn, _ := s.conn.(net.Conn)
+	return conn
 }
 
 // SetDeadline bounds every subsequent read and write, or clears the bound with a zero time
