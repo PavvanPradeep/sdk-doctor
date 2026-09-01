@@ -5,9 +5,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 )
+
+// schemePattern matches a scheme only at the very start of the value, so a scheme-less
+// value containing "://" later on (e.g. in a path or query) is not mistaken for having one
+var schemePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://`)
 
 type NetInterface struct {
 	Name      string
@@ -33,7 +38,7 @@ var proxyVars = []string{
 func redactProxy(value string) string {
 	// url.Parse misreads a scheme-less "user:pass@host:port" as scheme "user", so add one
 	toParse := value
-	schemeAdded := !strings.Contains(value, "://")
+	schemeAdded := !schemePattern.MatchString(value)
 	if schemeAdded {
 		toParse = "redact://" + value
 	}
