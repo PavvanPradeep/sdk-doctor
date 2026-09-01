@@ -458,8 +458,23 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 		}
 	}
 
-	for networkType, netInfo := range thisNode.AlternateNames {
-		if netInfo.Hostname != config.SourceHost {
+	// Sorted for a deterministic result if more than one alternate network matches
+	networkTypes := make([]string, 0, len(thisNode.AlternateNames))
+	for networkType := range thisNode.AlternateNames {
+		networkTypes = append(networkTypes, networkType)
+	}
+	sort.Strings(networkTypes)
+
+	for _, networkType := range networkTypes {
+		netInfo := thisNode.AlternateNames[networkType]
+
+		// A network that only remaps the port advertises no hostname of its own
+		altHostname := netInfo.Hostname
+		if altHostname == "" {
+			altHostname = hostname
+		}
+
+		if altHostname != config.SourceHost {
 			continue
 		}
 
