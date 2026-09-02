@@ -596,24 +596,49 @@ var sdkServices = map[string]bool{
 	"kvSSL": true, "mgmtSSL": true, "capiSSL": true, "n1qlSSL": true, "ftsSSL": true, "cbasSSL": true,
 }
 
-func matrixPorts(nodes []clusterNode, useTLS bool) ([]portDef, map[int]bool) {
+func isSDKService(name string, useTLS bool) bool {
+	return sdkServices[name] && strings.HasSuffix(name, "SSL") == useTLS
+}
+
+func nodeAdvertisesPort(node clusterNode, port int, useTLS bool) bool {
+	if port == 0 {
+		return false
+	}
+
+	for name, servicePort := range node.Services {
+		if servicePort == port && isSDKService(name, useTLS) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func countAdvertisingNodes(nodes []clusterNode, port int, useTLS bool) int {
+	count := 0
+	for _, node := range nodes {
+		if nodeAdvertisesPort(node, port, useTLS) {
+			count++
+		}
+	}
+	return count
+}
+
+func matrixPorts(nodes []clusterNode, useTLS bool) []portDef {
 	names := map[int]string{}
 	for _, p := range couchbasePorts {
 		names[p.Port] = p.Name
 	}
 
-	advertised := map[int]bool{}
 	for _, node := range nodes {
 		for name, port := range node.Services {
 			if port == 0 {
 				continue
 			}
 
-			names[port] = name
-
-			// Only the ports this run's connection scheme would actually be routed to
-			if sdkServices[name] && strings.HasSuffix(name, "SSL") == useTLS {
-				advertised[port] = true
+			currentName, found := names[port]
+			if !found || (!isSDKService(currentName, useTLS) && isSDKService(name, useTLS)) {
+				names[port] = name
 			}
 		}
 	}
@@ -624,7 +649,7 @@ func matrixPorts(nodes []clusterNode, useTLS bool) ([]portDef, map[int]bool) {
 	}
 	sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
 
-	return ports, advertised
+	return ports
 }
 
 // Windows reports refusals as WSAECONNREFUSED, which does not match syscall.ECONNREFUSED.
@@ -673,17 +698,24 @@ func httpProbeUnreachable(err error, timing memd.ConnectTiming) bool {
 }
 
 func scanPortMatrix(nodes []clusterNode, useTLS bool) {
-	ports, advertised := matrixPorts(nodes, useTLS)
+	ports := matrixPorts(nodes, useTLS)
+	var displayedPorts []int
+	for j, p := range ports {
+		for _, node := range nodes {
+			if nodeAdvertisesPort(node, p.Port, useTLS) {
+				displayedPorts = append(displayedPorts, j)
+				break
+			}
+		}
+	}
 
-	gLog.Log("Scanning %d Couchbase ports across all %d node(s), * marks a port your client connects to",
-		len(ports), len(nodes))
+	gLog.Log("Scanning %d Couchbase ports across all %d node(s); showing %d advertised client-facing port(s), n/a means the port is not advertised on that node",
+		len(ports), len(nodes), len(displayedPorts))
 
 	results := make([][]string, len(nodes))
 
 	// Reused by every port probe; a node behind several A records is probed at the first only
 	addrs := make([]string, len(nodes))
-	resolvedCount := 0
-
 	for i, node := range nodes {
 		results[i] = make([]string, len(ports))
 
@@ -705,7 +737,6 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 		}
 
 		addrs[i] = ips[0]
-		resolvedCount++
 	}
 
 	sem := make(chan struct{}, 32)
@@ -735,7 +766,8 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	for i, node := range nodes {
 		for j, p := range ports {
 			gReport.Ports = append(gReport.Ports,
-				portResult{node.Hostname, p.Port, p.Name, results[i][j], advertised[p.Port]})
+				portResult{node.Hostname, p.Port, p.Name, results[i][j],
+					nodeAdvertisesPort(node, p.Port, useTLS)})
 		}
 	}
 
@@ -747,27 +779,26 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	}
 
 	const portsPerRow = 8
-	for start := 0; start < len(ports); start += portsPerRow {
+	for start := 0; start < len(displayedPorts); start += portsPerRow {
 		end := start + portsPerRow
-		if end > len(ports) {
-			end = len(ports)
+		if end > len(displayedPorts) {
+			end = len(displayedPorts)
 		}
 
 		header := fmt.Sprintf("%-*s", nameWidth, "PORT MATRIX")
-		for _, p := range ports[start:end] {
-			label := strconv.Itoa(p.Port)
-			if advertised[p.Port] {
-				label = "*" + label
-			}
-
-			header += fmt.Sprintf(" %8s", label)
+		for _, j := range displayedPorts[start:end] {
+			header += fmt.Sprintf(" %8d", ports[j].Port)
 		}
 		gLog.Log("%s", header)
 
 		for i, node := range nodes {
 			row := fmt.Sprintf("%-*s", nameWidth, node.Hostname)
-			for j := start; j < end; j++ {
-				row += fmt.Sprintf(" %8s", results[i][j])
+			for _, j := range displayedPorts[start:end] {
+				state := "n/a"
+				if nodeAdvertisesPort(node, ports[j].Port, useTLS) {
+					state = results[i][j]
+				}
+				row += fmt.Sprintf(" %8s", state)
 			}
 			gLog.Log("%s", row)
 		}
@@ -777,8 +808,13 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 
 	for j, p := range ports {
 		var filtered, refused, open []string
+		advertisedNodes := countAdvertisingNodes(nodes, p.Port, useTLS)
 
 		for i, node := range nodes {
+			if addrs[i] == "" || !nodeAdvertisesPort(node, p.Port, useTLS) {
+				continue
+			}
+
 			switch results[i][j] {
 			case "filtered":
 				filtered = append(filtered, node.Hostname)
@@ -789,21 +825,20 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 			}
 		}
 
-		if len(filtered) > 0 && len(filtered) == resolvedCount {
+		if len(filtered) > 0 && len(filtered) == advertisedNodes {
 			gLog.Error(
-				"Port %d (%s) is filtered on all %d node(s).  Packets are being dropped rather"+
-					" than refused, and the behaviour is consistent across nodes, which indicates"+
-					" a firewall rule rather than a stopped service.",
-				p.Port, p.Name, resolvedCount)
+				"Port %d (%s) is filtered on all %d node(s) advertising it.  Packets are being"+
+					" dropped rather than refused, which indicates a firewall or network policy"+
+					" rather than a stopped service.",
+				p.Port, p.Name, advertisedNodes)
 		} else if len(filtered) > 0 {
 			gLog.Warn(
-				"Port %d (%s) is filtered on `%s` but not on every node.  Packets are being"+
-					" dropped on those hosts specifically, which indicates a per-host firewall"+
-					" rule rather than a cluster-wide one.",
+				"Port %d (%s) is filtered on `%s` but not confirmed on every node advertising it."+
+					"  This can indicate a per-host firewall rule; review the other node results above.",
 				p.Port, p.Name, strings.Join(filtered, ", "))
 		}
 
-		if len(refused) > 0 && advertised[p.Port] {
+		if len(refused) > 0 {
 			hosts := strings.Join(refused, ", ")
 			refusedAdvertised[hosts] = append(refusedAdvertised[hosts],
 				fmt.Sprintf("%d (%s)", p.Port, p.Name))
@@ -1371,7 +1406,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				client.Close()
 			}
 		} else {
-			gLog.Warn("Could not test %s service on `%s` as it was not in the config", svcName, node.Hostname)
+			gLog.Log("Not testing %s service on `%s`, the node does not run it", svcName, node.Hostname)
 		}
 	}
 
@@ -1422,7 +1457,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				}
 			}
 		} else {
-			gLog.Warn("Could not test %s service on `%s` as it was not in the config", svcName, node.Hostname)
+			gLog.Log("Not testing %s service on `%s`, the node does not run it", svcName, node.Hostname)
 		}
 	}
 
@@ -1435,7 +1470,13 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		testHTTPService(node, "Analytics", "cbas", "cbasSSL")
 	}
 
-	if svcOk == 0 && svcFailed > 0 && svcUnreachable == svcFailed {
+	if svcOk == 0 && svcFailed == 0 {
+		gLog.Error(
+			"No node advertises any client service port on the `%s` network, so no service could"+
+				" be tested.  Check that the cluster is configured for the scheme in your"+
+				" connection string, and that alternate addresses, if used, map the service ports.",
+			selectedNetwork)
+	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == svcFailed {
 		gLog.Error(
 			"Bootstrap succeeded but every one of the %d advertised service endpoints was"+
 				" unreachable.  This is the signature of a client sitting outside the cluster's"+
