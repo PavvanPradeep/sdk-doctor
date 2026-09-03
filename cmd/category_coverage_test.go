@@ -143,7 +143,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		}
 	}
 
-	// --- memcached protocol statuses, through the real mapper (helpers.CategoriesFromMemdStatus,
+	// --- memcached protocol statuses, through the real mapper (helpers.CategoryForMemdStatus,
 	//   the function auth() and selectBucket() in helpers/memdclient.go actually call). The
 	//   statuses themselves are the real wire constants from the memd package. ---
 	for name, status := range map[string]memd.StatusCode{
@@ -151,7 +151,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		"missing bucket":   memd.StatusKeyNotFound,
 		"forbidden bucket": memd.StatusAccessError,
 	} {
-		if got := helpers.CategoriesFromMemdStatus(status); got != "" {
+		if got := helpers.CategoryForMemdStatus(status); got != "" {
 			produced[got] = name
 		}
 	}
@@ -159,7 +159,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 	// --- cccp_unsupported comes from GetConfig's own unconditional mapping in
 	//   helpers/memdclient.go: any non-success status on CmdGetClusterConfig maps to
 	//   CategoryCCCPUnsupported regardless of what the status actually is, so
-	//   CategoriesFromMemdStatus above cannot exercise it. Driving it live requires a fake
+	//   CategoryForMemdStatus above cannot exercise it. Driving it live requires a fake
 	//   memcached server that gets through SASL auth and bucket selection before answering
 	//   CmdGetClusterConfig - exactly what helpers/memdclient_test.go's unexported
 	//   fakeServer does in TestDialReportsCCCPUnsupported, which is not reachable from this

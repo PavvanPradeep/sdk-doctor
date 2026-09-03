@@ -34,6 +34,20 @@ func startEchoListener(t *testing.T) (addr string, closeFn func()) {
 	return ln.Addr().String(), func() { ln.Close() }
 }
 
+// A DialError with a nil Err is unreachable through DialMemdConn today, but the type is
+// exported public surface, so a caller built some other way must not make Error() panic.
+func TestDialErrorDoesNotPanicOnNilErr(t *testing.T) {
+	e := &DialError{}
+
+	if got := e.Error(); got != "dial failed" {
+		t.Errorf("expected a sensible fallback message, got %q", got)
+	}
+
+	if got := e.Unwrap(); got != nil {
+		t.Errorf("expected Unwrap to still return the nil Err, got %v", got)
+	}
+}
+
 func TestDialMemdConnTimingNoTLS(t *testing.T) {
 	addr, closeFn := startEchoListener(t)
 	defer closeFn()

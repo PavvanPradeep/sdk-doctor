@@ -176,17 +176,30 @@ func bootstrapSummary(attempts []helpers.Attempt, bucket string) string {
 	case helpers.CategoryConfigInvalid, helpers.CategoryConfigEmpty:
 		summary = fmt.Sprintf(
 			"%d of %d endpoints responded but returned a configuration the doctor could not use.", hit, total)
-	default:
+	case "":
 		// Rule 1 already established that something answered above the network layer, so
-		//  the legacy "unreachable" sentence would be false here. Say what is actually
-		//  known instead: either nothing ranked was present, or the cause is unrecognised.
-		if selected == "" {
-			summary = fmt.Sprintf("%d endpoint(s) answered but none returned a usable configuration.", total)
-		} else {
-			summary = fmt.Sprintf(
-				"%d of %d endpoints failed after connecting, with a cause the doctor does not recognise.",
-				hit, total)
+		//  the legacy "unreachable" sentence would be false here. Nothing ranked is
+		//  present, so the categories actually observed are the whole story - naming them
+		//  inline (rather than falling through to the "further endpoint(s)" loop below)
+		//  keeps every attempt counted exactly once. Without this, categoryRank's "" match
+		//  makes countWithCategory(attempts, "") come back 0, so the primary sentence's
+		//  implied set would be empty while every real category showed up as "further" -
+		//  double-counting the very attempts the primary sentence was supposed to cover.
+		summary = fmt.Sprintf("%d endpoint(s) answered but none returned a usable configuration.", total)
+
+		if present := otherCategories(attempts, selected); len(present) > 0 {
+			labels := make([]string, 0, len(present))
+			for _, category := range present {
+				labels = append(labels, string(category))
+			}
+			summary += fmt.Sprintf("  Causes observed: %s.", strings.Join(labels, ", "))
 		}
+
+		return summary
+	default:
+		summary = fmt.Sprintf(
+			"%d of %d endpoints failed after connecting, with a cause the doctor does not recognise.",
+			hit, total)
 		if raw := firstError(attempts, selected); raw != "" {
 			summary += fmt.Sprintf("  The underlying error was: %s", raw)
 		}

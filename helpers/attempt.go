@@ -75,7 +75,6 @@ type AddressAttempt struct {
 type Attempt struct {
 	Kind      string
 	Endpoint  string
-	Resolved  []string         `json:",omitempty"`
 	Addresses []AddressAttempt `json:",omitempty"`
 	Phase     string
 	Category  string `json:",omitempty"`
@@ -196,8 +195,8 @@ func CategoryForHTTPStatus(code int) Category {
 	}
 }
 
-// PhaseOfDial reports the phase a failed dial died in, from the diagnostics it carried
-func PhaseOfDial(dialErr *memd.DialError) Phase {
+// phaseOfDial reports the phase a failed dial died in, from the diagnostics it carried
+func phaseOfDial(dialErr *memd.DialError) Phase {
 	switch {
 	case !dialErr.Timing.TLSStart.IsZero():
 		return PhaseTLS
@@ -210,10 +209,10 @@ func PhaseOfDial(dialErr *memd.DialError) Phase {
 	}
 }
 
-// CategoriesFromMemdStatus maps a memcached status to its category, exported so a
+// CategoryForMemdStatus maps a memcached status to its category, exported so a
 //
 //	coverage test can prove each one is produced by real code
-func CategoriesFromMemdStatus(status memd.StatusCode) Category {
+func CategoryForMemdStatus(status memd.StatusCode) Category {
 	switch status {
 	case memd.StatusAuthError:
 		return CategoryAuthRejected
@@ -239,6 +238,10 @@ func NewPhaseError(phase Phase, category Category, err error) *PhaseError {
 }
 
 func (e *PhaseError) Error() string {
+	if e.Err == nil {
+		return string(e.Category)
+	}
+
 	return e.Err.Error()
 }
 
@@ -256,8 +259,9 @@ type AttemptBuilder struct {
 	timing memd.ConnectTiming
 	sasl   time.Duration
 
-	resolved  []string
 	addresses []AddressAttempt
+
+	reached Phase
 }
 
 // NewAttempt starts recording an attempt against endpoint, stamping the start time
@@ -278,15 +282,19 @@ func (b *AttemptBuilder) WithTiming(timing memd.ConnectTiming, sasl time.Duratio
 	return b
 }
 
-// resolvedHost strips the port off address, so Resolved carries the resolved host set
-// rather than duplicating Addresses[].Address verbatim
-func resolvedHost(address string) string {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return address
-	}
+// withReached records the furthest phase a successful dial actually exercised - sasl or
+// select-bucket, depending on whether the bucket matched the authenticating user - so a
+// caller with no protocol step of its own beyond Dial can still seal the attempt correctly
+func (b *AttemptBuilder) withReached(phase Phase) *AttemptBuilder {
+	b.reached = phase
 
-	return host
+	return b
+}
+
+// Reached reports the furthest phase a successful dial actually exercised, recorded by
+// withReached. It is meaningless before Dial has returned successfully.
+func (b *AttemptBuilder) Reached() Phase {
+	return b.reached
 }
 
 func addressFamily(address string) string {
@@ -326,23 +334,19 @@ func (b *AttemptBuilder) withAddresses(results []memd.AddressResult, phase Phase
 		}
 
 		b.addresses = append(b.addresses, record)
-		b.resolved = append(b.resolved, resolvedHost(result.Address))
 	}
 
 	return b
 }
 
-// FromDial records the outcome of a memd dial, successful or not
-func (b *AttemptBuilder) FromDial(result *memd.DialResult, err error) Attempt {
-	if err == nil {
-		b.WithTiming(result.Timing, 0).withAddresses(result.Addresses, PhaseTCP)
-
-		return b.Finish(PhaseTCP, "", nil)
-	}
-
+// FromDial classifies and seals a failed helpers.Dial call: err is always non-nil here
+// (Dial itself calls Finish directly on success, via the reached phase it tracked), so
+// there is no success case to handle. Exported because callers of Dial, not just Dial
+// itself, need to turn the error it returns into a sealed Attempt.
+func (b *AttemptBuilder) FromDial(err error) Attempt {
 	var dialErr *memd.DialError
 	if errors.As(err, &dialErr) {
-		phase := PhaseOfDial(dialErr)
+		phase := phaseOfDial(dialErr)
 		b.WithTiming(dialErr.Timing, 0).withAddresses(dialErr.Addresses, phase)
 
 		return b.Finish(phase, Classify(phase, err), err)
@@ -357,35 +361,11 @@ func (b *AttemptBuilder) FromDial(result *memd.DialResult, err error) Attempt {
 	return b.Finish(PhaseNone, CategoryUnknown, err)
 }
 
-// RestampAttempt moves a completed attempt's outcome to a later phase, for failures that
-//
-//	happen after Dial has already returned its record.  start must be the time the overall
-//	attempt began (before Dial was called), so Elapsed is recomputed to cover the whole
-//	attempt rather than staying frozen at whatever Dial's own Finish measured.
-func RestampAttempt(attempt Attempt, phase Phase, err error, start time.Time) Attempt {
-	attempt.Phase = string(phase)
-	attempt.Error = err.Error()
-	attempt.Elapsed = Dur(time.Since(start))
-
-	var phaseErr *PhaseError
-	if errors.As(err, &phaseErr) {
-		attempt.Phase = string(phaseErr.Phase)
-		attempt.Category = string(phaseErr.Category)
-
-		return attempt
-	}
-
-	attempt.Category = string(Classify(phase, err))
-
-	return attempt
-}
-
 // Finish seals the record at the given phase and category
 func (b *AttemptBuilder) Finish(phase Phase, category Category, err error) Attempt {
 	attempt := Attempt{
 		Kind:      b.kind,
 		Endpoint:  b.endpoint,
-		Resolved:  b.resolved,
 		Addresses: b.addresses,
 		Phase:     string(phase),
 		Category:  string(category),

@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
-	"strings"
 	"testing"
 	"time"
 
@@ -131,7 +130,7 @@ func TestDialWrapsATransportFailureInsideAuthWithItsPhase(t *testing.T) {
 	host, port, closeFn := startDroppingServer(t)
 	defer closeFn()
 
-	client, attempt, err := Dial(host, port, "travel", "Administrator", "password", nil)
+	client, builder, err := Dial("service-kv", host, port, "travel", "Administrator", "password", nil)
 	if err == nil {
 		client.Close()
 		t.Fatal("expected the dial to fail when the peer drops the connection mid-auth")
@@ -145,6 +144,7 @@ func TestDialWrapsATransportFailureInsideAuthWithItsPhase(t *testing.T) {
 		t.Errorf("expected the sasl phase for a transport failure during auth, got %q", phaseErr.Phase)
 	}
 
+	attempt := builder.FromDial(err)
 	if attempt.Phase != string(PhaseSASL) {
 		t.Errorf("expected the attempt to record the sasl phase for a transport failure, got %q", attempt.Phase)
 	}
@@ -154,13 +154,14 @@ func TestDialRecordsTLSPhaseForATLSConnectedAddress(t *testing.T) {
 	host, port, closeFn := startFakeTLSServer(t, nil)
 	defer closeFn()
 
-	client, attempt, err := Dial(host, port, "Administrator", "Administrator", "password",
+	client, builder, err := Dial("service-kv", host, port, "Administrator", "Administrator", "password",
 		&tls.Config{InsecureSkipVerify: true})
 	if err != nil {
 		t.Fatalf("the dial itself should succeed: %s", err)
 	}
 	defer client.Close()
 
+	attempt := builder.Finish(builder.Reached(), "", nil)
 	if len(attempt.Addresses) == 0 {
 		t.Fatalf("expected at least one recorded address, got %+v", attempt)
 	}
@@ -177,7 +178,7 @@ func TestDialReportsAuthRejectionAsAPhaseError(t *testing.T) {
 	})
 	defer closeFn()
 
-	client, attempt, err := Dial(host, port, "travel", "Administrator", "wrong", nil)
+	client, builder, err := Dial("service-kv", host, port, "travel", "Administrator", "wrong", nil)
 	if err == nil {
 		client.Close()
 		t.Fatal("expected the dial to fail on a rejected SASL auth")
@@ -195,6 +196,7 @@ func TestDialReportsAuthRejectionAsAPhaseError(t *testing.T) {
 		t.Errorf("expected %q, got %q", CategoryAuthRejected, phaseErr.Category)
 	}
 
+	attempt := builder.FromDial(err)
 	if attempt.Phase != string(PhaseSASL) || attempt.Category != string(CategoryAuthRejected) {
 		t.Errorf("expected the attempt to carry the phase and category, got %+v", attempt)
 	}
@@ -204,14 +206,6 @@ func TestDialReportsAuthRejectionAsAPhaseError(t *testing.T) {
 	if len(attempt.Addresses) != 1 || attempt.Addresses[0].Error != "" {
 		t.Errorf("expected one successfully connected address, got %+v", attempt.Addresses)
 	}
-
-	// Resolved should carry the resolved host set, not Addresses[].Address verbatim -
-	// each entry must be a bare IP with the port stripped off.
-	for _, resolved := range attempt.Resolved {
-		if net.ParseIP(resolved) == nil || strings.Contains(resolved, ":") {
-			t.Errorf("expected Resolved to hold bare IPs with no port, got %q", resolved)
-		}
-	}
 }
 
 func TestDialReportsBucketNotFound(t *testing.T) {
@@ -220,7 +214,7 @@ func TestDialReportsBucketNotFound(t *testing.T) {
 	})
 	defer closeFn()
 
-	client, _, err := Dial(host, port, "nosuchbucket", "Administrator", "password", nil)
+	client, _, err := Dial("service-kv", host, port, "nosuchbucket", "Administrator", "password", nil)
 	if err == nil {
 		client.Close()
 		t.Fatal("expected the dial to fail selecting a missing bucket")
@@ -248,12 +242,13 @@ func TestDialReportsCCCPUnsupported(t *testing.T) {
 	// bucket ("travel") != user ("Administrator"), so selectBucket runs and the
 	// successful attempt should report having reached PhaseSelectBucket, the furthest
 	// rung this dial actually exercised.
-	client, attempt, err := Dial(host, port, "travel", "Administrator", "password", nil)
+	client, builder, err := Dial("bootstrap-cccp", host, port, "travel", "Administrator", "password", nil)
 	if err != nil {
 		t.Fatalf("the dial itself should succeed: %s", err)
 	}
 	defer client.Close()
 
+	attempt := builder.Finish(builder.Reached(), "", nil)
 	if attempt.Phase != string(PhaseSelectBucket) {
 		t.Errorf("expected the select-bucket phase on a successful dial that ran selectBucket, got %q", attempt.Phase)
 	}
@@ -282,14 +277,61 @@ func TestDialReportsSASLPhaseWhenSelectBucketIsSkipped(t *testing.T) {
 
 	// bucket == user means Dial never calls selectBucket, so the successful attempt
 	// must not claim a phase further than sasl - that would report a rung that never ran.
-	client, attempt, err := Dial(host, port, "Administrator", "Administrator", "password", nil)
+	client, builder, err := Dial("service-kv", host, port, "Administrator", "Administrator", "password", nil)
 	if err != nil {
 		t.Fatalf("the dial itself should succeed: %s", err)
 	}
 	defer client.Close()
 
+	attempt := builder.Finish(builder.Reached(), "", nil)
 	if attempt.Phase != string(PhaseSASL) {
 		t.Errorf("expected the sasl phase when selectBucket is skipped, got %q", attempt.Phase)
+	}
+}
+
+// TestDialTagsTheAttemptWithItsKindParameter pins the mechanism A3 depends on: Dial's
+// first argument must reach the sealed Attempt's Kind field unchanged. Without this, the
+// connectivity probe ("service-kv") and the performance dial ("perf-kv") would collapse
+// back into one indistinguishable value in the report, exactly the collision A3 fixed.
+func TestDialTagsTheAttemptWithItsKindParameter(t *testing.T) {
+	host, port, closeFn := startFakeServer(t, nil)
+	defer closeFn()
+
+	// bucket == user, so selectBucket is skipped - kind is the only thing under test here.
+	client, builder, err := Dial("perf-kv", host, port, "Administrator", "Administrator", "password", nil)
+	if err != nil {
+		t.Fatalf("the dial itself should succeed: %s", err)
+	}
+	defer client.Close()
+
+	attempt := builder.Finish(builder.Reached(), "", nil)
+	if attempt.Kind != "perf-kv" {
+		t.Errorf("expected the attempt to carry the kind passed to Dial, got %q", attempt.Kind)
+	}
+}
+
+// TestDialFailureProducesARecordableAttempt pins the other half of A3: a failed dial must
+// still yield an Attempt with something meaningful to record (a non-empty Phase and
+// Category), not a zero value that a caller's recordAttempt call would silently drop.
+func TestDialFailureProducesARecordableAttempt(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve a port: %s", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	_, builder, err := Dial("perf-kv", "127.0.0.1", port, "travel", "Administrator", "password", nil)
+	if err == nil {
+		t.Fatal("expected the dial to fail against a closed port")
+	}
+
+	attempt := builder.FromDial(err)
+	if attempt.Phase == "" {
+		t.Errorf("expected a non-empty phase on a failed dial, got %+v", attempt)
+	}
+	if attempt.Category == "" {
+		t.Errorf("expected a non-empty category on a failed dial, got %+v", attempt)
 	}
 }
 
@@ -301,12 +343,13 @@ func TestDialRecordsAFailedConnectAsAnAttempt(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
-	client, attempt, err := Dial("127.0.0.1", port, "travel", "Administrator", "password", nil)
+	client, builder, err := Dial("service-kv", "127.0.0.1", port, "travel", "Administrator", "password", nil)
 	if err == nil {
 		client.Close()
 		t.Fatal("expected the dial to fail against a closed port")
 	}
 
+	attempt := builder.FromDial(err)
 	if attempt.Phase != string(PhaseTCP) {
 		t.Errorf("expected the tcp phase, got %q", attempt.Phase)
 	}

@@ -184,6 +184,52 @@ func TestBootstrapSummaryRanksAuthAboveAnUnreachableNode(t *testing.T) {
 	}
 }
 
+// TestBootstrapSummaryCountsAnUnrankedCategoryOnceOnly pins the fix for the bug the A1
+// phase change exposed: tcp_timeout (and every other pre-TCP-phase category) is not in
+// categoryRank, so a single response-phase attempt whose category is tcp_timeout used to
+// make rankedCategory return "", which made the primary sentence's implied set empty
+// while the "further endpoint(s)" loop then named tcp_timeout on top of it - the one
+// attempt was counted as both "answered" and "further", which is incoherent for a run of
+// exactly one. The fix names the observed categories inline and returns early, so nothing
+// is double-counted.
+func TestBootstrapSummaryCountsAnUnrankedCategoryOnceOnly(t *testing.T) {
+	attempts := []helpers.Attempt{
+		attempt("bootstrap-http-terse", "node1:8091", helpers.PhaseResponse, helpers.CategoryTCPTimeout),
+	}
+
+	got := bootstrapSummary(attempts, "travel")
+
+	if !strings.Contains(got, "tcp_timeout") {
+		t.Errorf("expected the observed category to be named, got:\n%s", got)
+	}
+	if strings.Contains(got, "unreachable") {
+		t.Errorf("did not expect the legacy 'unreachable' wording, got:\n%s", got)
+	}
+	if strings.Contains(got, "further") {
+		t.Errorf("did not expect 'further' for a run with a single attempt, got:\n%s", got)
+	}
+}
+
+// TestBootstrapSummaryRankedPathStillAppendsFurther is the companion to the test above:
+// once a category IS ranked (selected != ""), the "further endpoint(s)" loop is still the
+// wanted behaviour for naming every other category present, and must not have been
+// disturbed by scoping the fix to the selected == "" case only.
+func TestBootstrapSummaryRankedPathStillAppendsFurther(t *testing.T) {
+	attempts := []helpers.Attempt{
+		attempt("bootstrap-cccp", "node1:11210", helpers.PhaseTCP, helpers.CategoryTCPTimeout),
+		attempt("bootstrap-cccp", "node2:11210", helpers.PhaseSASL, helpers.CategoryAuthRejected),
+	}
+
+	got := bootstrapSummary(attempts, "travel")
+
+	if !strings.Contains(got, "Authentication was rejected by 1 of 2 endpoints") {
+		t.Errorf("expected the ranked cause to lead, got:\n%s", got)
+	}
+	if !strings.Contains(got, "1 further endpoint(s) failed with tcp_timeout") {
+		t.Errorf("expected the unranked category to still be appended as 'further', got:\n%s", got)
+	}
+}
+
 func TestBootstrapSummaryFallsBackToTheRawError(t *testing.T) {
 	// This attempt got past TCP (PhaseConfig), so rule 1 does not apply and the legacy
 	//  "unreachable" sentence would be false here — the default branch must say something

@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/couchbaselabs/gocbconnstr"
@@ -92,11 +91,11 @@ func probeTLSChain(host string, port int) bool {
 }
 
 func logConnectPhases(attempt helpers.Attempt, timing memd.ConnectTiming) {
+	recordAttempt(attempt)
+
 	if attempt.TCP == "" {
 		return
 	}
-
-	recordAttempt(attempt)
 
 	dns := attempt.DNS
 	if dns == "" {
@@ -542,6 +541,8 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 			phase = helpers.PhaseDNS
 		case !timing.TLSStart.IsZero():
 			phase = helpers.PhaseTLS
+		case !timing.TCPDone.IsZero():
+			phase = helpers.PhaseResponse
 		}
 
 		attempt := builder.WithTiming(timing, 0).Finish(phase, helpers.Classify(phase, err), err)
@@ -587,20 +588,15 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 		user = bucket
 	}
 
-	// Captured before Dial so RestampAttempt (and the success path below) can recompute
-	//  Elapsed over the whole attempt, not just the portion Dial's own Finish measured.
-	start := time.Now()
-
-	client, attempt, err := helpers.Dial(host, port, bucket, user, pass, tlsConfig)
-	attempt.Kind = "bootstrap-cccp"
+	client, builder, err := helpers.Dial("bootstrap-cccp", host, port, bucket, user, pass, tlsConfig)
 	if err != nil {
-		return terseBucketConfig{}, attempt, err
+		return terseBucketConfig{}, builder.FromDial(err), err
 	}
 	defer client.Close()
 
 	configBytes, err := client.GetConfig()
 	if err != nil {
-		return terseBucketConfig{}, helpers.RestampAttempt(attempt, helpers.PhaseConfig, err, start), err
+		return terseBucketConfig{}, builder.FromDial(err), err
 	}
 
 	configBytes = bytes.Replace(configBytes, []byte("$HOST"), []byte(host), -1)
@@ -608,17 +604,13 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 	var config terseBucketConfig
 	err = json.Unmarshal(configBytes, &config)
 	if err != nil {
-		return terseBucketConfig{}, helpers.RestampAttempt(attempt,
-			helpers.PhaseConfig, helpers.NewPhaseError(helpers.PhaseConfig, helpers.CategoryConfigInvalid, err), start), err
+		return terseBucketConfig{}, builder.Finish(helpers.PhaseConfig, helpers.CategoryConfigInvalid, err), err
 	}
 
 	config.SourceHost = host
 	config.SourcePort = port
 
-	attempt.Phase = string(helpers.PhaseConfig)
-	attempt.Elapsed = helpers.Dur(time.Since(start))
-
-	return config, attempt, nil
+	return config, builder.Finish(helpers.PhaseConfig, "", nil), nil
 }
 
 type portDef struct {
@@ -669,9 +661,6 @@ func matrixPorts(nodes []clusterNode, useTLS bool) ([]portDef, map[int]bool) {
 
 	return ports, advertised
 }
-
-// Windows reports refusals as WSAECONNREFUSED, which does not match syscall.ECONNREFUSED.
-const wsaeConnRefused = syscall.Errno(10061)
 
 // isConnRefused reports whether the peer answered with a refusal, which proves the
 // packets reached it and nothing was listening
@@ -1405,11 +1394,10 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 		svcPort := node.Services[svcKey]
 		if svcPort != 0 {
-			client, attempt, err := helpers.Dial(node.Hostname, svcPort,
+			client, builder, err := helpers.Dial("service-"+svcKeyPlain, node.Hostname, svcPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
-			attempt.Kind = "service-" + svcKeyPlain
 			if err != nil {
-				recordAttempt(attempt)
+				recordAttempt(builder.FromDial(err))
 
 				svcFailed++
 				if isConnRefused(err) {
@@ -1427,7 +1415,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				gLog.Log("Successfully connected to %s service at `%s:%d`",
 					svcName, node.Hostname, node.Services[svcKey])
 
-				recordAttempt(attempt)
+				recordAttempt(builder.Finish(builder.Reached(), "", nil))
 				client.Close()
 			}
 		} else {
@@ -1538,15 +1526,18 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		}
 
 		if kvPort != 0 {
-			client, attempt, err := helpers.Dial(node.Hostname, kvPort,
+			client, builder, err := helpers.Dial("perf-kv", node.Hostname, kvPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
+				recordAttempt(builder.FromDial(err))
+
 				gLog.Warn(
 					"Failed to perform KV connection performance analysis on `%s:%d` (error: %s)",
 					node.Hostname, kvPort, err.Error())
 				continue
 			}
 
+			attempt := builder.Finish(builder.Reached(), "", nil)
 			logConnectPhases(attempt, client.Timing())
 
 			firstOpStart := time.Now()

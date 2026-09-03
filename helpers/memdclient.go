@@ -21,16 +21,21 @@ type MemdClient struct {
 // dialBudget bounds connect and authentication together
 const dialBudget = 2000 * time.Millisecond
 
-// Dial will dial a particular host and return a MemdClient, along with a record of
+// Dial will dial a particular host, tagging the attempt it records with kind, and return
 //
-//	the attempt that is populated whether it succeeded or failed
-func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (*MemdClient, Attempt, error) {
+//	a MemdClient along with the builder that has been accumulating that attempt's record
+//	throughout. The builder is always non-nil, whether the dial succeeded or failed, so
+//	the caller seals it themselves with builder.Finish once it knows the phase and
+//	category the outcome belongs to: on success that is builder.Reached() unless a later
+//	protocol step (a CCCP config fetch, say) decides the real final phase, and on failure
+//	it is whatever builder.FromDial(err) derives from err.
+func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (*MemdClient, *AttemptBuilder, error) {
 	if user == "" {
 		user = bucket
 	}
 
 	address := fmt.Sprintf("%s:%d", host, port)
-	builder := NewAttempt("service-kv", address, dialBudget)
+	builder := NewAttempt(kind, address, dialBudget)
 
 	deadline := time.Now().Add(dialBudget)
 
@@ -42,7 +47,7 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 
 	dialResult, err := memd.DialMemdConn(address, srvTLSConfig, deadline)
 	if err != nil {
-		return nil, builder.FromDial(nil, err), err
+		return nil, builder, err
 	}
 
 	var client MemdClient
@@ -65,7 +70,7 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 	builder.WithTiming(dialResult.Timing, client.saslDuration)
 	if err != nil {
 		client.Close()
-		return nil, builder.FromDial(nil, err), err
+		return nil, builder, err
 	}
 
 	// Phase reached so far, in case selectBucket is skipped below
@@ -75,7 +80,7 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 		err = client.selectBucket(bucket)
 		if err != nil {
 			client.Close()
-			return nil, builder.FromDial(nil, err), err
+			return nil, builder, err
 		}
 
 		// selectBucket ran and succeeded: it is the furthest rung actually reached
@@ -85,7 +90,7 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 	// The dial deadline covered connect and auth, operations from here on carry their own
 	client.conn.SetDeadline(time.Time{})
 
-	return &client, builder.Finish(reached, "", nil), nil
+	return &client, builder.withReached(reached), nil
 }
 
 // Close closes a connection
@@ -172,10 +177,10 @@ func (client *MemdClient) auth(user, pass string) error {
 
 	if resp.Status != 0 {
 		if resp.Status == memd.StatusAuthError {
-			return NewPhaseError(PhaseSASL, CategoriesFromMemdStatus(resp.Status), errors.New("invalid bucket name/password"))
+			return NewPhaseError(PhaseSASL, CategoryForMemdStatus(resp.Status), errors.New("invalid bucket name/password"))
 		}
 
-		return NewPhaseError(PhaseSASL, CategoriesFromMemdStatus(resp.Status),
+		return NewPhaseError(PhaseSASL, CategoryForMemdStatus(resp.Status),
 			fmt.Errorf("SASL auth failed for user `%s` (status: %d)", user, resp.Status))
 	}
 
@@ -200,7 +205,7 @@ func (client *MemdClient) selectBucket(bucket string) error {
 	}
 
 	if resp.Status != 0 {
-		return NewPhaseError(PhaseSelectBucket, CategoriesFromMemdStatus(resp.Status),
+		return NewPhaseError(PhaseSelectBucket, CategoryForMemdStatus(resp.Status),
 			fmt.Errorf("failed to select bucket `%s` (status: %d)", bucket, resp.Status))
 	}
 

@@ -494,3 +494,54 @@ func TestFetchHTTPTerseBucketConfigReportsARejectedCertAsTLS(t *testing.T) {
 		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryTLSVerify)
 	}
 }
+
+// A server that completes the TCP handshake and then never answers (a hung mgmt port, a
+// stalling proxy, an overloaded node) must be reported at the response phase, not the TCP
+// phase: timing.TCPDone is stamped only when a connect succeeds, so it is the "we reached
+// the server" signal even though the request itself never got an answer. Misclassifying
+// this at PhaseTCP would make reachedPastTCP false and emit the legacy "unreachable"
+// sentence for an endpoint that was demonstrably reached.
+func TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+	defer ln.Close()
+
+	// Accept every connection and never write a response. The goroutine exits on its own
+	// once the client (after its own timeout) drops the connection.
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig("127.0.0.1", addr.Port, "default", "u", "p", nil)
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseResponse) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseResponse, err)
+	}
+
+	summary := bootstrapSummary([]helpers.Attempt{gotAttempt}, "default")
+	if strings.Contains(summary, "unreachable") {
+		t.Errorf("a hung server that completed the TCP handshake must not be reported as"+
+			" unreachable, got: %s", summary)
+	}
+}

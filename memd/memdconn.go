@@ -103,6 +103,10 @@ type DialError struct {
 }
 
 func (e *DialError) Error() string {
+	if e.Err == nil {
+		return "dial failed"
+	}
+
 	return e.Err.Error()
 }
 

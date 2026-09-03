@@ -185,6 +185,20 @@ func TestClassifyReturnsNoCategoryForSuccess(t *testing.T) {
 	}
 }
 
+// A PhaseError with a nil Err is unreachable through NewPhaseError today, but the type is
+// exported public surface, so a caller built some other way must not make Error() panic.
+func TestPhaseErrorDoesNotPanicOnNilErr(t *testing.T) {
+	e := &PhaseError{Phase: PhaseTLS, Category: CategoryTLSVerify}
+
+	if got := e.Error(); got != string(CategoryTLSVerify) {
+		t.Errorf("expected the category as a fallback message, got %q", got)
+	}
+
+	if got := e.Unwrap(); got != nil {
+		t.Errorf("expected Unwrap to still return the nil Err, got %v", got)
+	}
+}
+
 func TestDurMatchesTheReportFormat(t *testing.T) {
 	tests := []struct {
 		in   time.Duration

@@ -110,12 +110,12 @@ func TestLogConnectPhasesWithoutDNSOrTLS(t *testing.T) {
 	}
 }
 
-// TestLogConnectPhasesSkipsAttemptsWithoutTCP pins the early-return guard: an attempt that
-//
-//	never reached TCP (Attempt.TCP is empty) must neither be recorded nor logged. This is the
-//	seam that failed unnoticed in the first pass of Task 6, since neither existing test above
-//	exercises an attempt with an empty TCP field.
-func TestLogConnectPhasesSkipsAttemptsWithoutTCP(t *testing.T) {
+// TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP pins the corrected behaviour:
+// an attempt that never reached TCP (Attempt.TCP is empty) must still be recorded in the
+// report, since recording and logging are separate responsibilities and a reused
+// keep-alive HTTP connection produces exactly this shape. Only the phases log line is
+// skipped, since there is nothing to format without a TCP timing.
+func TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP(t *testing.T) {
 	var out strings.Builder
 	gLog = helpers.Logger{}
 	gLog.SetOutput(&out)
@@ -124,8 +124,8 @@ func TestLogConnectPhasesSkipsAttemptsWithoutTCP(t *testing.T) {
 	logConnectPhases(helpers.NewAttempt("service-kv", "10.0.0.1:11210", 2000*time.Millisecond).
 		Finish(helpers.PhaseNone, "", nil), memd.ConnectTiming{})
 
-	if len(gReport.Attempts) != 0 {
-		t.Fatalf("expected no attempt recorded when TCP was never measured, got %+v", gReport.Attempts)
+	if len(gReport.Attempts) != 1 {
+		t.Fatalf("expected the attempt to be recorded even without TCP timing, got %+v", gReport.Attempts)
 	}
 	if out.String() != "" {
 		t.Fatalf("expected no log output when TCP was never measured, got %q", out.String())
