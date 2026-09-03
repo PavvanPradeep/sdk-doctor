@@ -91,45 +91,51 @@ func probeTLSChain(host string, port int) bool {
 	return true
 }
 
-func logConnectPhases(host string, port int, timing memd.ConnectTiming, sasl time.Duration) {
-	if timing.TCPStart.IsZero() {
+func logConnectPhases(attempt helpers.Attempt, timing memd.ConnectTiming) {
+	if attempt.TCP == "" {
 		return
 	}
 
-	entry := connectResult{Host: host, Port: port, TCP: dur(timing.TCP())}
-	if !timing.DNSStart.IsZero() {
-		entry.DNS = dur(timing.DNS())
-	}
-	if !timing.TLSStart.IsZero() {
-		entry.TLS = dur(timing.TLS())
-	}
-	if sasl > 0 {
-		entry.SASL = dur(sasl)
-	}
-	gReport.Connects = append(gReport.Connects, entry)
+	recordAttempt(attempt)
 
-	dns := entry.DNS
+	dns := attempt.DNS
 	if dns == "" {
 		dns = "-"
 	}
 
-	phases := fmt.Sprintf("dns %s, tcp %s", dns, entry.TCP)
+	phases := fmt.Sprintf("dns %s, tcp %s", dns, attempt.TCP)
 
-	if entry.TLS != "" {
-		phases += fmt.Sprintf(", tls %s", entry.TLS)
+	if attempt.TLS != "" {
+		phases += fmt.Sprintf(", tls %s", attempt.TLS)
 	}
-	if entry.SASL != "" {
-		phases += fmt.Sprintf(", sasl %s", entry.SASL)
+	if attempt.SASL != "" {
+		phases += fmt.Sprintf(", sasl %s", attempt.SASL)
 	}
 
-	gLog.Log("Connect phases for `%s:%d`: %s", host, port, phases)
+	host, port := splitEndpoint(attempt.Endpoint)
+	gLog.Log("Connect phases for `%s:%s`: %s", host, port, phases)
 
-	if timing.TCP() > 20*time.Millisecond && timing.DNS() > 0 && timing.TCP() > 5*timing.DNS() {
+	if tcpSlowerThanDNS(timing) {
 		gLog.Warn(
-			"TCP handshake to `%s:%d` took %s against %s for DNS resolution --"+
+			"TCP handshake to `%s:%s` took %s against %s for DNS resolution --"+
 				" latency appears to be on the network path, not name resolution.",
-			host, port, dur(timing.TCP()), dur(timing.DNS()))
+			host, port, attempt.TCP, attempt.DNS)
 	}
+}
+
+// splitEndpoint breaks a "host:port" endpoint back into its parts for logging
+func splitEndpoint(endpoint string) (host, port string) {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return endpoint, ""
+	}
+
+	return host, port
+}
+
+// tcpSlowerThanDNS reports whether the handshake dominated resolution by enough to be worth telling the user about
+func tcpSlowerThanDNS(timing memd.ConnectTiming) bool {
+	return timing.TCP() > 20*time.Millisecond && timing.DNS() > 0 && timing.TCP() > 5*timing.DNS()
 }
 
 func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming) {
@@ -1399,9 +1405,12 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 		svcPort := node.Services[svcKey]
 		if svcPort != 0 {
-			client, _, err := helpers.Dial(node.Hostname, svcPort,
+			client, attempt, err := helpers.Dial(node.Hostname, svcPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
+			attempt.Kind = "service-" + svcKeyPlain
 			if err != nil {
+				recordAttempt(attempt)
+
 				svcFailed++
 				if isConnRefused(err) {
 					svcRefused++
@@ -1418,6 +1427,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				gLog.Log("Successfully connected to %s service at `%s:%d`",
 					svcName, node.Hostname, node.Services[svcKey])
 
+				recordAttempt(attempt)
 				client.Close()
 			}
 		} else {
@@ -1442,8 +1452,14 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 			req, phases := traceRequest(req)
 
+			builder := helpers.NewAttempt("service-"+svcKeyPlain,
+				fmt.Sprintf("%s:%d", node.Hostname, svcPort), 2000*time.Millisecond)
+
 			resp, err := testHTTPClient.Do(req)
 			if err != nil {
+				recordAttempt(builder.WithTiming(phases(), 0).
+					Finish(helpers.PhaseTCP, helpers.Classify(helpers.PhaseTCP, err), err))
+
 				svcFailed++
 				if isConnRefused(err) {
 					svcRefused++
@@ -1458,11 +1474,12 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			} else {
 				resp.Body.Close()
 
+				timing := phases()
+				logConnectPhases(builder.WithTiming(timing, 0).Finish(helpers.PhaseResponse, "", nil), timing)
+
 				svcOk++
 				gLog.Log("Successfully connected to %s service at `%s:%d`",
 					svcName, node.Hostname, node.Services[svcKey])
-
-				logConnectPhases(node.Hostname, svcPort, phases(), 0)
 
 				if resp.TLS != nil && !tlsReported[node.Hostname] {
 					tlsReported[node.Hostname] = true
@@ -1521,7 +1538,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		}
 
 		if kvPort != 0 {
-			client, _, err := helpers.Dial(node.Hostname, kvPort,
+			client, attempt, err := helpers.Dial(node.Hostname, kvPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
 				gLog.Warn(
@@ -1530,7 +1547,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				continue
 			}
 
-			logConnectPhases(node.Hostname, kvPort, client.Timing(), client.SASLDuration())
+			logConnectPhases(attempt, client.Timing())
 
 			firstOpStart := time.Now()
 			firstOpErr := client.Ping()

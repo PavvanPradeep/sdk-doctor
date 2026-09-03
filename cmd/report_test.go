@@ -18,14 +18,17 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 	gReport = diagnosticReport{ConnectionString: "couchbases://node1"}
 
 	base := time.Now()
-	logConnectPhases("node1", 11207, memd.ConnectTiming{
+	timing := memd.ConnectTiming{
 		DNSStart: base,
 		DNSDone:  base.Add(2 * time.Millisecond),
 		TCPStart: base.Add(2 * time.Millisecond),
 		TCPDone:  base.Add(10 * time.Millisecond),
 		TLSStart: base.Add(10 * time.Millisecond),
 		TLSDone:  base.Add(40 * time.Millisecond),
-	}, 5*time.Millisecond)
+	}
+	logConnectPhases(helpers.NewAttempt("service-kv", "node1:11207", 2000*time.Millisecond).
+		WithTiming(timing, 5*time.Millisecond).
+		Finish(helpers.PhaseSelectBucket, "", nil), timing)
 
 	gLog.Warn("something looks off")
 
@@ -48,13 +51,27 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 		t.Fatalf("unexpected report header: %+v", got)
 	}
 
-	if len(got.Connects) != 1 {
-		t.Fatalf("expected one connect result, got %+v", got.Connects)
+	// Asserted against the literal, not the reportSchemaVersion constant: comparing against
+	//  the same symbol the code under test reads would make this pass no matter what the
+	//  constant was changed to, pinning nothing. The whole point of a schema version is to
+	//  be a stable published number, so this must fail if it silently changes.
+	if got.SchemaVersion != 1 {
+		t.Fatalf("expected schema version 1, got %d", got.SchemaVersion)
 	}
 
-	want := connectResult{Host: "node1", Port: 11207, DNS: "2ms", TCP: "8ms", TLS: "30ms", SASL: "5ms"}
-	if got.Connects[0] != want {
-		t.Fatalf("expected %+v, got %+v", want, got.Connects[0])
+	if len(got.Attempts) != 1 {
+		t.Fatalf("expected one attempt, got %+v", got.Attempts)
+	}
+
+	attempt := got.Attempts[0]
+	if attempt.Kind != "service-kv" || attempt.Endpoint != "node1:11207" {
+		t.Errorf("unexpected attempt identity: %+v", attempt)
+	}
+	if attempt.DNS != "2ms" || attempt.TCP != "8ms" || attempt.TLS != "30ms" || attempt.SASL != "5ms" {
+		t.Errorf("unexpected phase durations: %+v", attempt)
+	}
+	if attempt.Category != "" {
+		t.Errorf("expected no category on a successful attempt, got %q", attempt.Category)
 	}
 
 	var warned bool
@@ -75,16 +92,72 @@ func TestLogConnectPhasesWithoutDNSOrTLS(t *testing.T) {
 	gReport = diagnosticReport{}
 
 	base := time.Now()
-	logConnectPhases("10.0.0.1", 11210, memd.ConnectTiming{
+	timing := memd.ConnectTiming{
 		TCPStart: base,
 		TCPDone:  base.Add(3 * time.Millisecond),
-	}, 0)
+	}
+	logConnectPhases(helpers.NewAttempt("service-kv", "10.0.0.1:11210", 2000*time.Millisecond).
+		WithTiming(timing, 0).
+		Finish(helpers.PhaseSelectBucket, "", nil), timing)
 
-	if got := gReport.Connects[0]; got.DNS != "" || got.TLS != "" || got.SASL != "" {
+	if got := gReport.Attempts[0]; got.DNS != "" || got.TLS != "" || got.SASL != "" {
 		t.Fatalf("expected only a TCP phase, got %+v", got)
 	}
 
+	// The existing log wording is unchanged
 	if !strings.Contains(out.String(), "dns -, tcp 3ms") {
 		t.Fatalf("expected an unmeasured DNS phase in the log, got %s", out.String())
+	}
+}
+
+// TestLogConnectPhasesSkipsAttemptsWithoutTCP pins the early-return guard: an attempt that
+//
+//	never reached TCP (Attempt.TCP is empty) must neither be recorded nor logged. This is the
+//	seam that failed unnoticed in the first pass of Task 6, since neither existing test above
+//	exercises an attempt with an empty TCP field.
+func TestLogConnectPhasesSkipsAttemptsWithoutTCP(t *testing.T) {
+	var out strings.Builder
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+
+	logConnectPhases(helpers.NewAttempt("service-kv", "10.0.0.1:11210", 2000*time.Millisecond).
+		Finish(helpers.PhaseNone, "", nil), memd.ConnectTiming{})
+
+	if len(gReport.Attempts) != 0 {
+		t.Fatalf("expected no attempt recorded when TCP was never measured, got %+v", gReport.Attempts)
+	}
+	if out.String() != "" {
+		t.Fatalf("expected no log output when TCP was never measured, got %q", out.String())
+	}
+}
+
+// TestLogConnectPhasesPreservesTheAttemptKindVerbatim pins that logConnectPhases (and the
+//
+//	report pipeline behind it) never rewrites Kind: whatever string the caller built the
+//	attempt with — including the port-label form service probes use, e.g. "service-mgmt" —
+//	comes out the other end unchanged. This does not, and cannot without integration
+//	scaffolding, catch a caller building the wrong Kind in the first place (the
+//	svcName-vs-svcKeyPlain mistake this task avoided lives inside the unexported
+//	testMemdService/testHTTPService closures in diagnose.go, which have no seam reachable
+//	from a unit test); it only pins that the pipeline is not where such a bug could hide.
+func TestLogConnectPhasesPreservesTheAttemptKindVerbatim(t *testing.T) {
+	gLog = helpers.Logger{}
+	gLog.SetOutput(ioutil.Discard)
+	gReport = diagnosticReport{}
+
+	timing := memd.ConnectTiming{
+		TCPStart: time.Now(),
+		TCPDone:  time.Now().Add(time.Millisecond),
+	}
+	logConnectPhases(helpers.NewAttempt("service-mgmt", "node1:8091", 2000*time.Millisecond).
+		WithTiming(timing, 0).
+		Finish(helpers.PhaseResponse, "", nil), timing)
+
+	if len(gReport.Attempts) != 1 {
+		t.Fatalf("expected one attempt, got %+v", gReport.Attempts)
+	}
+	if got := gReport.Attempts[0].Kind; got != "service-mgmt" {
+		t.Fatalf("expected Kind to stay the port-label form %q, got %q", "service-mgmt", got)
 	}
 }
