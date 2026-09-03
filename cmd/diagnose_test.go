@@ -432,3 +432,65 @@ func TestIsConnRefused(t *testing.T) {
 		t.Fatalf("expected a lookup failure to not be a refusal, got %v", dnsErr)
 	}
 }
+
+// A refused TCP connection must be reported at the TCP phase, not the DNS phase: the
+// httptrace hook that would otherwise prove a successful connect never fires on a
+// refusal, so the phase has to be inferred from the error itself, not from timing alone.
+func TestFetchHTTPTerseBucketConfigReportsARefusedPortAsTCP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+	addr := ln.Addr().(*net.TCPAddr)
+	ln.Close()
+
+	_, refusedErr := net.DialTimeout("tcp", addr.String(), time.Second)
+	if refusedErr == nil {
+		t.Skip("the released port was taken by another listener")
+	}
+
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig("127.0.0.1", addr.Port, "default", "u", "p", nil)
+	if err == nil {
+		t.Fatal("expected a connection-refused error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseTCP) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseTCP, err)
+	}
+	if gotAttempt.Category != string(helpers.CategoryTCPRefused) {
+		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryTCPRefused)
+	}
+}
+
+// A rejected server certificate must be reported at the TLS phase, not the TCP phase:
+// httptrace stamps TLSHandshakeDone even when the handshake fails, so a naive "TLS
+// finished cleanly" check can't tell a completed handshake from a rejected one.
+func TestFetchHTTPTerseBucketConfigReportsARejectedCertAsTLS(t *testing.T) {
+	srv := httptest.NewTLSServer(nil)
+	defer srv.Close()
+
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A non-nil but otherwise default config: default certificate verification applies,
+	// and the server's self-signed cert is not in any trust store this test controls.
+	tlsConfig := &tls.Config{}
+
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig(host, port, "default", "u", "p", tlsConfig)
+	if err == nil {
+		t.Fatal("expected a certificate verification error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseTLS) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseTLS, err)
+	}
+	if gotAttempt.Category != string(helpers.CategoryTLSVerify) {
+		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryTLSVerify)
+	}
+}

@@ -357,6 +357,29 @@ func (b *AttemptBuilder) FromDial(result *memd.DialResult, err error) Attempt {
 	return b.Finish(PhaseNone, CategoryUnknown, err)
 }
 
+// RestampAttempt moves a completed attempt's outcome to a later phase, for failures that
+//
+//	happen after Dial has already returned its record.  start must be the time the overall
+//	attempt began (before Dial was called), so Elapsed is recomputed to cover the whole
+//	attempt rather than staying frozen at whatever Dial's own Finish measured.
+func RestampAttempt(attempt Attempt, phase Phase, err error, start time.Time) Attempt {
+	attempt.Phase = string(phase)
+	attempt.Error = err.Error()
+	attempt.Elapsed = Dur(time.Since(start))
+
+	var phaseErr *PhaseError
+	if errors.As(err, &phaseErr) {
+		attempt.Phase = string(phaseErr.Phase)
+		attempt.Category = string(phaseErr.Category)
+
+		return attempt
+	}
+
+	attempt.Category = string(Classify(phase, err))
+
+	return attempt
+}
+
 // Finish seals the record at the given phase and category
 func (b *AttemptBuilder) Finish(phase Phase, category Category, err error) Attempt {
 	attempt := Attempt{

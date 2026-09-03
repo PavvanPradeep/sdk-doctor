@@ -315,3 +315,24 @@ func TestReachedPastTCP(t *testing.T) {
 		}
 	}
 }
+
+// markAttemptCategory must amend only the endpoint it names. A host bootstrapped over
+// both CCCP and HTTP produces two attempts sharing a hostname on different ports; a
+// match keyed on the endpoint's host alone would stamp both, mislabeling whichever one
+// actually succeeded.
+func TestMarkAttemptCategoryLeavesAnUnrelatedEndpointAlone(t *testing.T) {
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-cccp", "hostA:11210", helpers.PhaseConfig, ""),
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseResponse, ""),
+	}
+
+	markAttemptCategory("hostA:8091", helpers.CategoryConfigEmpty)
+
+	if got := gReport.Attempts[0].Category; got != "" {
+		t.Errorf("unrelated endpoint hostA:11210 was amended: category = %q, want empty", got)
+	}
+	if got := gReport.Attempts[1].Category; got != string(helpers.CategoryConfigEmpty) {
+		t.Errorf("named endpoint hostA:8091 was not amended: category = %q, want %q", got, helpers.CategoryConfigEmpty)
+	}
+}

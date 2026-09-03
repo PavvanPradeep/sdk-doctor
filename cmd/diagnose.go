@@ -493,7 +493,10 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 	return "default"
 }
 
-func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, error) {
+// httpConfigBudget bounds a single config fetch over HTTP
+const httpConfigBudget = 2000 * time.Millisecond
+
+func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, helpers.Attempt, error) {
 	if user == "" {
 		user = bucket
 	}
@@ -503,7 +506,7 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	}
 	httpClient := &http.Client{
 		Transport: httpTransport,
-		Timeout:   2000 * time.Millisecond,
+		Timeout:   httpConfigBudget,
 	}
 
 	scheme := "http"
@@ -511,27 +514,52 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 		scheme = "https"
 	}
 
+	endpoint := fmt.Sprintf("%s:%d", host, port)
+	builder := helpers.NewAttempt("bootstrap-http-terse", endpoint, httpConfigBudget)
+
 	uri := fmt.Sprintf("%s://%s:%d/pools/default/b/%s", scheme, host, port, bucket)
 	req, _ := http.NewRequest("GET", uri, nil)
 	req.SetBasicAuth(user, pass)
 
+	// The same tracer the HTTP service probe uses, so both paths report the same phases
+	req, phases := traceRequest(req)
+
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return terseBucketConfig{}, err
+		timing := phases()
+
+		phase := helpers.PhaseTCP
+
+		var dnsErr *net.DNSError
+		switch {
+		case errors.As(err, &dnsErr):
+			phase = helpers.PhaseDNS
+		case !timing.TLSStart.IsZero():
+			phase = helpers.PhaseTLS
+		}
+
+		attempt := builder.WithTiming(timing, 0).Finish(phase, helpers.Classify(phase, err), err)
+
+		return terseBucketConfig{}, attempt, err
 	}
 	defer resp.Body.Close()
 
+	builder.WithTiming(phases(), 0)
+
 	if resp.StatusCode != 200 {
+		category := helpers.CategoryForHTTPStatus(resp.StatusCode)
+
+		statusErr := fmt.Errorf("http error (status code: %d)", resp.StatusCode)
 		if resp.StatusCode == 401 {
-			return terseBucketConfig{}, errors.New("incorrect bucket/password")
+			statusErr = errors.New("incorrect bucket/password")
 		}
 
-		return terseBucketConfig{}, fmt.Errorf("http error (status code: %d)", resp.StatusCode)
+		return terseBucketConfig{}, builder.Finish(helpers.PhaseResponse, category, statusErr), statusErr
 	}
 
 	configBytes, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return terseBucketConfig{}, err
+		return terseBucketConfig{}, builder.Finish(helpers.PhaseResponse, helpers.Classify(helpers.PhaseResponse, err), err), err
 	}
 
 	configBytes = bytes.Replace(configBytes, []byte("$HOST"), []byte(host), -1)
@@ -539,29 +567,34 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	var config terseBucketConfig
 	err = json.Unmarshal(configBytes, &config)
 	if err != nil {
-		return terseBucketConfig{}, err
+		return terseBucketConfig{}, builder.Finish(helpers.PhaseConfig, helpers.CategoryConfigInvalid, err), err
 	}
 
 	config.SourceHost = host
 	config.SourcePort = port
 
-	return config, nil
+	return config, builder.Finish(helpers.PhaseConfig, "", nil), nil
 }
 
-func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, error) {
+func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, helpers.Attempt, error) {
 	if user == "" {
 		user = bucket
 	}
 
-	client, _, err := helpers.Dial(host, port, bucket, user, pass, tlsConfig)
+	// Captured before Dial so RestampAttempt (and the success path below) can recompute
+	//  Elapsed over the whole attempt, not just the portion Dial's own Finish measured.
+	start := time.Now()
+
+	client, attempt, err := helpers.Dial(host, port, bucket, user, pass, tlsConfig)
+	attempt.Kind = "bootstrap-cccp"
 	if err != nil {
-		return terseBucketConfig{}, err
+		return terseBucketConfig{}, attempt, err
 	}
 	defer client.Close()
 
 	configBytes, err := client.GetConfig()
 	if err != nil {
-		return terseBucketConfig{}, err
+		return terseBucketConfig{}, helpers.RestampAttempt(attempt, helpers.PhaseConfig, err, start), err
 	}
 
 	configBytes = bytes.Replace(configBytes, []byte("$HOST"), []byte(host), -1)
@@ -569,13 +602,17 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 	var config terseBucketConfig
 	err = json.Unmarshal(configBytes, &config)
 	if err != nil {
-		return terseBucketConfig{}, err
+		return terseBucketConfig{}, helpers.RestampAttempt(attempt,
+			helpers.PhaseConfig, helpers.NewPhaseError(helpers.PhaseConfig, helpers.CategoryConfigInvalid, err), start), err
 	}
 
 	config.SourceHost = host
 	config.SourcePort = port
 
-	return config, nil
+	attempt.Phase = string(helpers.PhaseConfig)
+	attempt.Elapsed = helpers.Dur(time.Since(start))
+
+	return config, attempt, nil
 }
 
 type portDef struct {
@@ -1084,6 +1121,13 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 			thisNodeExt := config.GetSourceNodeExt()
 			if thisNodeExt == nil {
+				gLog.Error(
+					"Bootstrap host `%s` returned a configuration that does not describe the node"+
+						" itself, so it cannot be used.",
+					target.Host)
+
+				markAttemptCategory(fmt.Sprintf("%s:%d", target.Host, target.Port), helpers.CategoryConfigEmpty)
+
 				continue
 			}
 
@@ -1112,7 +1156,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				gLog.Log("Attempting to fetch config via cccp from `%s:%d`", target.Host, target.Port)
 
 				// Query the host
-				config, err := fetchCccpTerseBucketConfig(target.Host, target.Port, resConnSpec.Bucket, username, password, tlsConfig)
+				config, attempt, err := fetchCccpTerseBucketConfig(target.Host, target.Port, resConnSpec.Bucket, username, password, tlsConfig)
+				recordAttempt(attempt)
 				if err != nil {
 					gLog.Error(
 						"Failed to fetch configuration via cccp from `%s:%d` (error: %s)",
@@ -1148,7 +1193,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				gLog.Log("Attempting to fetch terse config via http from `%s:%d`", target.Host, target.Port)
 
 				// Query the host
-				config, err := fetchHTTPTerseBucketConfig(target.Host, target.Port, resConnSpec.Bucket, username, password, tlsConfig)
+				config, attempt, err := fetchHTTPTerseBucketConfig(target.Host, target.Port, resConnSpec.Bucket, username, password, tlsConfig)
+				recordAttempt(attempt)
 				if err != nil {
 					gLog.Error(
 						"Failed to fetch terse configuration via http from `%s:%d` (error: %s)",
@@ -1189,9 +1235,15 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 	// Failed to bootstrap
 	if nodesList == nil {
-		gLog.Error(
-			"All endpoints specified by your connection string were unreachable, further" +
-				" cluster diagnostics are not possible")
+		if len(gReport.Attempts) > 0 {
+			gLog.NewLine()
+			fmt.Fprint(gLog.Writer(), "Bootstrap attempts:\n")
+			fmt.Fprint(gLog.Writer(), renderAttemptTable(gReport.Attempts))
+			gLog.NewLine()
+		}
+
+		gLog.Error("%s", bootstrapSummary(gReport.Attempts, resConnSpec.Bucket))
+
 		return
 	}
 

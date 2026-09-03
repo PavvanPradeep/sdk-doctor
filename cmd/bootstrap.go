@@ -19,6 +19,26 @@ func recordAttempt(attempt helpers.Attempt) {
 	gReport.Attempts = append(gReport.Attempts, attempt)
 }
 
+// markAttemptCategory downgrades an already-recorded attempt whose configuration turned
+//
+//	out to be unusable, which is only discovered after the fetch returned successfully.
+//	endpoint is matched exactly (not by host prefix) and only the first uncategorized
+//	match is amended, so a host that appears more than once in the report — the same
+//	hostname bootstrapped over both CCCP and HTTP, say — cannot have an unrelated
+//	attempt's outcome overwritten by this one's.
+func markAttemptCategory(endpoint string, category helpers.Category) {
+	for i := range gReport.Attempts {
+		attempt := &gReport.Attempts[i]
+
+		if attempt.Category != "" || attempt.Endpoint != endpoint {
+			continue
+		}
+
+		attempt.Category = string(category)
+		return
+	}
+}
+
 // phasesPastTCP are the phases that prove an endpoint answered above the network layer
 var phasesPastTCP = map[string]bool{
 	string(helpers.PhaseTLS):          true,
