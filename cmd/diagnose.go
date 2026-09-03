@@ -33,7 +33,7 @@ func stripIPv6Address(address string) string {
 
 // dur formats a duration for the log, as most connect phases are sub-millisecond
 func dur(d time.Duration) string {
-	return d.Round(time.Microsecond).String()
+	return helpers.Dur(d)
 }
 
 const certExpiryWarnDays = 30
@@ -633,9 +633,7 @@ const wsaeConnRefused = syscall.Errno(10061)
 // isConnRefused reports whether the peer answered with a refusal, which proves the
 // packets reached it and nothing was listening
 func isConnRefused(err error) bool {
-	var errno syscall.Errno
-
-	return errors.As(err, &errno) && (errno == syscall.ECONNREFUSED || errno == wsaeConnRefused)
+	return helpers.IsConnRefused(err)
 }
 
 func probePort(host string, port int, timeout time.Duration) string {
