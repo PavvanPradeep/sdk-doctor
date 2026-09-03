@@ -75,6 +75,7 @@ type diagnosticReport struct {
 	ConfigSource     string              `json:",omitempty"`
 	ClockSkew        string              `json:",omitempty"`
 	Nodes            []clusterNode       `json:",omitempty"`
+	Attempts         []helpers.Attempt   `json:",omitempty"`
 	Ports            []portResult        `json:",omitempty"`
 	Connects         []connectResult     `json:",omitempty"`
 	Latency          []latencyResult     `json:",omitempty"`
