@@ -37,11 +37,15 @@ func TestGetSourceNodeExt(t *testing.T) {
 
 func TestMatrixPorts(t *testing.T) {
 	nodes := []clusterNode{
-		{Hostname: "a", Services: map[string]int{"indexAdmin": 9100, "kv": 11210, "kvSSL": 11207}},
-		{Hostname: "b", Services: map[string]int{"projector": 9999, "capi": 0}},
+		{Hostname: "a", Services: map[string]int{
+			"indexAdmin": 9100, "kv": 11210, "kvSSL": 11207, "mgmt": 8091, "n1ql": 8093,
+		}},
+		{Hostname: "b", Services: map[string]int{
+			"projector": 9999, "capi": 0, "kv": 11210, "mgmt": 8091,
+		}},
 	}
 
-	ports, advertised := matrixPorts(nodes, false)
+	ports := matrixPorts(nodes, false)
 
 	got := map[int]string{}
 	for i, p := range ports {
@@ -51,7 +55,7 @@ func TestMatrixPorts(t *testing.T) {
 			t.Fatalf("ports are not sorted/deduped at %d: %+v", i, ports)
 		}
 	}
-	for _, want := range []int{8091, 9100, 9999, 11207, 11210} {
+	for _, want := range []int{8091, 8093, 9100, 9999, 11207, 11210} {
 		if _, ok := got[want]; !ok {
 			t.Fatalf("expected port %d in matrix, got %+v", want, ports)
 		}
@@ -60,18 +64,29 @@ func TestMatrixPorts(t *testing.T) {
 		t.Fatalf("zero port should not be probed: %+v", ports)
 	}
 
-	// Only the client-facing ports for this connection's scheme are advertised
-	if !advertised[11210] {
-		t.Fatalf("kv is a client-facing port, got %+v", advertised)
+	if !nodeAdvertisesPort(nodes[0], 8093, false) {
+		t.Fatal("node a runs n1ql, so it should advertise 8093")
 	}
-	for _, unwanted := range []int{11207, 9100, 9999, 8091, 0} {
-		if advertised[unwanted] {
-			t.Fatalf("port %d should not be flagged for a plain connection, got %+v", unwanted, advertised)
+	if nodeAdvertisesPort(nodes[1], 8093, false) {
+		t.Fatal("node b does not run n1ql, so it must not advertise 8093")
+	}
+
+	for _, unwanted := range []int{0, 9100, 9999, 11207} {
+		if nodeAdvertisesPort(nodes[0], unwanted, false) {
+			t.Fatalf("port %d should not be advertised for a plain connection", unwanted)
 		}
 	}
 
-	if _, advertised := matrixPorts(nodes, true); !advertised[11207] || advertised[11210] {
-		t.Fatalf("a secured connection uses kvSSL and not kv, got %+v", advertised)
+	if !nodeAdvertisesPort(nodes[0], 11207, true) || nodeAdvertisesPort(nodes[0], 11210, true) {
+		t.Fatal("a secured connection should use kvSSL and not kv")
+	}
+
+	unresolved := []clusterNode{
+		{Hostname: "reachable", Services: map[string]int{"n1ql": 8093}},
+		{Hostname: "does-not-resolve.invalid", Services: map[string]int{"n1ql": 8093}},
+	}
+	if got := countAdvertisingNodes(unresolved, 8093, false); got != 2 {
+		t.Fatalf("DNS must not shrink the advertising-node denominator: got %d, want 2", got)
 	}
 }
 
@@ -126,6 +141,49 @@ func TestScanPortMatrixWarnsOnceForRefusedClientPorts(t *testing.T) {
 
 	if strings.Contains(out.String(), "indexAdmin)") {
 		t.Fatalf("internal services should not be warned about:\n%s", out.String())
+	}
+}
+
+func TestScanPortMatrixSkipsNodesNotAdvertisingAPort(t *testing.T) {
+	bindPort := func() (int, func()) {
+		t.Helper()
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %s", err)
+		}
+
+		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+
+		return port, func() { ln.Close() }
+	}
+
+	kvPort, closeKv := bindPort()
+	defer closeKv()
+
+	n1qlPort, closeN1ql := bindPort()
+	closeN1ql()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+
+	scanPortMatrix([]clusterNode{
+		{Hostname: "127.0.0.1", Services: map[string]int{"kv": kvPort, "n1ql": n1qlPort}},
+		{Hostname: "127.0.0.1", Services: map[string]int{"kv": kvPort}},
+	}, false)
+
+	if warns := strings.Count(out.String(), "Cluster advertises"); warns != 1 {
+		t.Fatalf("expected a single warning for the one node advertising n1ql, got %d:\n%s", warns, out.String())
+	}
+
+	if !strings.Contains(out.String(), "on `127.0.0.1` which refuse connections") {
+		t.Fatalf("the node that does not advertise n1ql must not be named:\n%s", out.String())
+	}
+
+	if strings.Contains(out.String(), "but open on") {
+		t.Fatalf("a port only one node advertises cannot be open elsewhere:\n%s", out.String())
 	}
 }
 
