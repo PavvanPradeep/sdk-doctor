@@ -115,6 +115,11 @@ type memdConn struct {
 	recvBuf []byte
 }
 
+// NewConn wraps an existing connection, for tests and for callers that dial themselves
+func NewConn(conn io.ReadWriteCloser) ReadWriteCloser {
+	return &memdConn{conn: conn}
+}
+
 // attemptDeadline splits the time left evenly, so a filtered address cannot swallow it all
 func attemptDeadline(deadline, now time.Time, remainingAddrs int) time.Time {
 	remaining := deadline.Sub(now)

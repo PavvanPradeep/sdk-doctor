@@ -553,7 +553,7 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 		user = bucket
 	}
 
-	client, err := helpers.Dial(host, port, bucket, user, pass, tlsConfig)
+	client, _, err := helpers.Dial(host, port, bucket, user, pass, tlsConfig)
 	if err != nil {
 		return terseBucketConfig{}, err
 	}
@@ -1347,7 +1347,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 		svcPort := node.Services[svcKey]
 		if svcPort != 0 {
-			client, err := helpers.Dial(node.Hostname, svcPort,
+			client, _, err := helpers.Dial(node.Hostname, svcPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
 				svcFailed++
@@ -1469,7 +1469,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		}
 
 		if kvPort != 0 {
-			client, err := helpers.Dial(node.Hostname, kvPort,
+			client, _, err := helpers.Dial(node.Hostname, kvPort,
 				resConnSpec.Bucket, username, password, tlsConfig)
 			if err != nil {
 				gLog.Warn(
