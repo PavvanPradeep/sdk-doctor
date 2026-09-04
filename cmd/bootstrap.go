@@ -60,6 +60,7 @@ var categoryRank = []helpers.Category{
 	helpers.CategoryTLSHandshake,
 	helpers.CategoryResponseTimeout,
 	helpers.CategoryCCCPUnsupported,
+	helpers.CategoryConfigUnavailable,
 	helpers.CategoryConfigInvalid,
 	helpers.CategoryConfigEmpty,
 	helpers.CategoryServerError,
@@ -161,6 +162,10 @@ func bootstrapSummary(attempts []helpers.Attempt, bucket string) string {
 	case helpers.CategoryServerError:
 		summary = fmt.Sprintf(
 			"%d of %d endpoints returned a server error rather than a configuration.", hit, total)
+	case helpers.CategoryConfigUnavailable:
+		summary = fmt.Sprintf(
+			"%d of %d endpoints authenticated but had no configuration available for"+
+				" bucket `%s`.", hit, total, bucket)
 	case helpers.CategoryConfigInvalid, helpers.CategoryConfigEmpty:
 		summary = fmt.Sprintf(
 			"%d of %d endpoints responded but returned a configuration the doctor could not use.", hit, total)

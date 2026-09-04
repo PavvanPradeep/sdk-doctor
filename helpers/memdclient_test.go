@@ -338,3 +338,37 @@ func TestDialRecordsAFailedConnectAsAnAttempt(t *testing.T) {
 		t.Errorf("expected the dial budget to be recorded, got %q", attempt.Timeout)
 	}
 }
+
+// A SASL failure is an authentication failure whatever status carries it.  Routing it through
+// CategoryForMemdStatus, a select-bucket mapper, reported EACCESS/KEY_ENOENT as bucket problems.
+func TestDialReportsEverySASLStatusAsAnAuthFailure(t *testing.T) {
+	for _, status := range []memd.StatusCode{
+		memd.StatusAuthError,
+		memd.StatusAccessError,
+		memd.StatusKeyNotFound,
+	} {
+		host, port, closeFn := startFakeServer(t, map[memd.CommandCode]memd.StatusCode{
+			memd.CmdSASLAuth: status,
+		})
+
+		_, _, err := Dial("bootstrap-cccp", host, port, "travel", "Administrator", "password", nil)
+		closeFn()
+
+		if err == nil {
+			t.Fatalf("status %#x: expected the dial to fail", status)
+		}
+
+		var phaseErr *PhaseError
+		if !errors.As(err, &phaseErr) {
+			t.Fatalf("status %#x: expected a *PhaseError, got %T", status, err)
+		}
+
+		if phaseErr.Phase != PhaseSASL {
+			t.Errorf("status %#x: phase = %q, want %q", status, phaseErr.Phase, PhaseSASL)
+		}
+
+		if phaseErr.Category != CategoryAuthRejected {
+			t.Errorf("status %#x: category = %q, want %q", status, phaseErr.Category, CategoryAuthRejected)
+		}
+	}
+}

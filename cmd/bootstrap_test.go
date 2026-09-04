@@ -395,6 +395,7 @@ func TestCategoryRankOrdersTheMostActionableCauseFirst(t *testing.T) {
 		helpers.CategoryTLSHandshake,
 		helpers.CategoryResponseTimeout,
 		helpers.CategoryCCCPUnsupported,
+		helpers.CategoryConfigUnavailable,
 		helpers.CategoryConfigInvalid,
 		helpers.CategoryConfigEmpty,
 		helpers.CategoryServerError,
@@ -491,5 +492,31 @@ func TestMarkAttemptCategoryBlamesTheMastersOwnRecordOnADuplicateEndpoint(t *tes
 		if a.Category != "" {
 			t.Errorf("attempt[%d] was blamed with %q though the master config was usable", i, a.Category)
 		}
+	}
+}
+
+// "returned a configuration the doctor could not use" is false when none was returned at all
+func TestBootstrapSummarySeparatesAnAbsentConfigFromAnUnusableOne(t *testing.T) {
+	absent := bootstrapSummary([]helpers.Attempt{
+		attempt("bootstrap-cccp", "node1:11210", helpers.PhaseConfig, helpers.CategoryConfigUnavailable),
+	}, "travel")
+
+	if strings.Contains(absent, "returned a configuration") {
+		t.Errorf("an absent configuration was described as one that was returned:\n%s", absent)
+	}
+	if !strings.Contains(absent, "no configuration available for bucket `travel`") {
+		t.Errorf("expected the absent configuration to be named, got:\n%s", absent)
+	}
+
+	unusable := bootstrapSummary([]helpers.Attempt{
+		attempt("bootstrap-http-terse", "node1:8091", helpers.PhaseConfig, helpers.CategoryConfigEmpty),
+	}, "travel")
+
+	if !strings.Contains(unusable, "returned a configuration the doctor could not use") {
+		t.Errorf("expected the unusable configuration to keep its sentence, got:\n%s", unusable)
+	}
+
+	if absent == unusable {
+		t.Error("both config faults produced the same sentence")
 	}
 }

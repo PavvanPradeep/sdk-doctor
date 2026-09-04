@@ -43,8 +43,10 @@ const (
 	CategoryCCCPUnsupported Category = "cccp_unsupported"
 	CategoryConfigInvalid   Category = "config_invalid"
 	CategoryConfigEmpty     Category = "config_empty"
-	CategoryServerError     Category = "server_error"
-	CategoryUnknown         Category = "unknown"
+	// CategoryConfigUnavailable is no configuration at all, as against one that came back empty
+	CategoryConfigUnavailable Category = "config_unavailable"
+	CategoryServerError       Category = "server_error"
+	CategoryUnknown           Category = "unknown"
 )
 
 // AllCategories lists every category, so a test can prove each one is reachable
@@ -54,7 +56,7 @@ func AllCategories() []Category {
 		CategoryTCPRefused, CategoryTCPTimeout, CategoryTCPUnreachable,
 		CategoryTLSHandshake, CategoryTLSVerify, CategoryResponseTimeout,
 		CategoryAuthRejected, CategoryBucketNotFound, CategoryBucketForbidden,
-		CategoryCCCPUnsupported, CategoryConfigInvalid, CategoryConfigEmpty,
+		CategoryCCCPUnsupported, CategoryConfigUnavailable, CategoryConfigInvalid, CategoryConfigEmpty,
 		CategoryServerError, CategoryUnknown,
 	}
 }
@@ -145,6 +147,19 @@ func Classify(phase Phase, err error) Category {
 		}
 	}
 
+	// Checked before the TLS split, so a handshake that stalls is reported as a stall rather
+	// than as two ends that could not agree
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		switch phase {
+		case PhaseTLS, PhaseSASL, PhaseSelectBucket, PhaseResponse, PhaseConfig:
+			// These phases only run on an established connection, so this is not a TCP timeout
+			return CategoryResponseTimeout
+		default:
+			return CategoryTCPTimeout
+		}
+	}
+
 	if phase == PhaseTLS {
 		if isCertificateError(err) {
 			return CategoryTLSVerify
@@ -159,17 +174,6 @@ func Classify(phase Phase, err error) Category {
 
 	if isUnreachable(err) {
 		return CategoryTCPUnreachable
-	}
-
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		switch phase {
-		case PhaseSASL, PhaseSelectBucket, PhaseResponse, PhaseConfig:
-			// These phases only run on an established connection, so this is not a TCP timeout
-			return CategoryResponseTimeout
-		default:
-			return CategoryTCPTimeout
-		}
 	}
 
 	return CategoryUnknown
@@ -222,9 +226,10 @@ func CategoryForMemdStatus(status memd.StatusCode) Category {
 // CategoryForConfigStatus maps a failed config fetch, preferring a named cause over "unsupported"
 func CategoryForConfigStatus(status memd.StatusCode) Category {
 	// The bucket is already established on this connection by the time a config is fetched, so
-	// KEY_ENOENT here means no configuration was available, not that the bucket is missing
+	// KEY_ENOENT here means no configuration came back, not that the bucket is missing.  That
+	// is a distinct fault from a configuration that did come back and described no nodes.
 	if status == memd.StatusKeyNotFound {
-		return CategoryConfigEmpty
+		return CategoryConfigUnavailable
 	}
 
 	if category := CategoryForMemdStatus(status); category != CategoryUnknown {

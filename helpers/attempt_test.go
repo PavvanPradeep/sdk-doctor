@@ -165,6 +165,9 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 	}{
 		{PhaseNone, CategoryTCPTimeout},
 		{PhaseTCP, CategoryTCPTimeout},
+		// TLS runs on an established connection, so a stall there is the peer going quiet,
+		// not a handshake the two ends could not agree on
+		{PhaseTLS, CategoryResponseTimeout},
 		{PhaseSASL, CategoryResponseTimeout},
 		{PhaseSelectBucket, CategoryResponseTimeout},
 		{PhaseResponse, CategoryResponseTimeout},
@@ -176,10 +179,16 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 			t.Errorf("Classify(%q, timeout) = %q, want %q", test.phase, got, test.want)
 		}
 	}
+}
 
-	// A TLS-phase stall already has its own category and must not be renamed
-	if got := Classify(PhaseTLS, errTestTimeout{}); got != CategoryTLSHandshake {
-		t.Errorf("Classify(tls, timeout) = %q, want %q", got, CategoryTLSHandshake)
+// A TLS error that is not a timeout must still be named by the handshake/trust split
+func TestClassifyKeepsTheTLSSplitForNonTimeoutErrors(t *testing.T) {
+	if got := Classify(PhaseTLS, tls.RecordHeaderError{Msg: "not a handshake"}); got != CategoryTLSHandshake {
+		t.Errorf("Classify(tls, record header) = %q, want %q", got, CategoryTLSHandshake)
+	}
+
+	if got := Classify(PhaseTLS, x509.UnknownAuthorityError{}); got != CategoryTLSVerify {
+		t.Errorf("Classify(tls, unknown authority) = %q, want %q", got, CategoryTLSVerify)
 	}
 }
 
@@ -200,8 +209,9 @@ func TestCategoryForConfigStatusKeepsMeaningfulStatuses(t *testing.T) {
 		{memd.StatusAccessError, CategoryBucketForbidden},
 		{memd.StatusAuthError, CategoryAuthRejected},
 		// select_bucket has already succeeded for this bucket by the time a config is fetched,
-		// so KEY_ENOENT here cannot mean the bucket is missing: it means no config is available
-		{memd.StatusKeyNotFound, CategoryConfigEmpty},
+		// so KEY_ENOENT here cannot mean the bucket is missing: no configuration came back at
+		// all, which is a different fault from one that came back describing no nodes
+		{memd.StatusKeyNotFound, CategoryConfigUnavailable},
 	}
 
 	for _, test := range tests {

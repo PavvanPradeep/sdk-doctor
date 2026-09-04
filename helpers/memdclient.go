@@ -168,12 +168,15 @@ func (client *MemdClient) auth(user, pass string) error {
 		return NewPhaseError(PhaseSASL, Classify(PhaseSASL, err), err)
 	}
 
+	// A failure here is an authentication failure whatever status carries it, so the status is
+	// not run through CategoryForMemdStatus: that maps the select-bucket meanings of KEY_ENOENT
+	// and EACCESS, which would report an auth failure as a bucket problem
 	if resp.Status != 0 {
 		if resp.Status == memd.StatusAuthError {
-			return NewPhaseError(PhaseSASL, CategoryForMemdStatus(resp.Status), errors.New("invalid bucket name/password"))
+			return NewPhaseError(PhaseSASL, CategoryAuthRejected, errors.New("invalid bucket name/password"))
 		}
 
-		return NewPhaseError(PhaseSASL, CategoryForMemdStatus(resp.Status),
+		return NewPhaseError(PhaseSASL, CategoryAuthRejected,
 			fmt.Errorf("SASL auth failed for user `%s` (status: %d)", user, resp.Status))
 	}
 

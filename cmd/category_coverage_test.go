@@ -141,6 +141,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 	// cccp_unsupported through the mapper GetConfig calls, so no category is asserted by fiat
 	for name, status := range map[string]memd.StatusCode{
 		"cccp unsupported": memd.StatusUnknownCommand,
+		"no configuration": memd.StatusKeyNotFound,
 	} {
 		if got := helpers.CategoryForConfigStatus(status); got != "" {
 			produced[got] = name
