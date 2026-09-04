@@ -16,15 +16,6 @@ type portResult struct {
 	Advertised bool
 }
 
-type connectResult struct {
-	Host string
-	Port int
-	DNS  string `json:",omitempty"`
-	TCP  string
-	TLS  string `json:",omitempty"`
-	SASL string `json:",omitempty"`
-}
-
 type latencyResult struct {
 	Host        string
 	Port        int
@@ -65,7 +56,11 @@ type tcpCountersResult struct {
 	Lost             uint32
 }
 
+// reportSchemaVersion is bumped whenever a field's meaning changes, so a consumer can tell
+const reportSchemaVersion = 1
+
 type diagnosticReport struct {
+	SchemaVersion    int
 	StartedAt        time.Time
 	FinishedAt       time.Time
 	ConnectionString string
@@ -75,8 +70,8 @@ type diagnosticReport struct {
 	ConfigSource     string              `json:",omitempty"`
 	ClockSkew        string              `json:",omitempty"`
 	Nodes            []clusterNode       `json:",omitempty"`
+	Attempts         []helpers.Attempt   `json:",omitempty"`
 	Ports            []portResult        `json:",omitempty"`
-	Connects         []connectResult     `json:",omitempty"`
 	Latency          []latencyResult     `json:",omitempty"`
 	TLS              []tlsResult         `json:",omitempty"`
 	IdleTest         []idleTestResult    `json:",omitempty"`
@@ -87,6 +82,7 @@ type diagnosticReport struct {
 var gReport diagnosticReport
 
 func writeReport(path string) error {
+	gReport.SchemaVersion = reportSchemaVersion
 	gReport.FinishedAt = time.Now()
 	gReport.Log = gLog.Entries()
 

@@ -42,6 +42,12 @@ func (l *Logger) Entries() []LogEntry {
 	return l.entries
 }
 
+// Writer returns the log's destination, so callers printing raw blocks stay in step
+//
+//	with the log and remain redirectable in tests
+func (l *Logger) Writer() io.Writer {
+	return l.writer()
+}
 
 func (l *Logger) NewLine() {
 	fmt.Fprintf(l.writer(), "\n")

@@ -18,15 +18,19 @@ type MemdClient struct {
 	saslDuration time.Duration
 }
 
-// Dial will dial a particular host and return a MemdClient
-func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (*MemdClient, error) {
+// dialBudget bounds connect and authentication together
+const dialBudget = 2000 * time.Millisecond
+
+// Dial returns the builder recording the attempt, non-nil either way, for the caller to seal
+func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (*MemdClient, *AttemptBuilder, error) {
 	if user == "" {
 		user = bucket
 	}
 
 	address := fmt.Sprintf("%s:%d", host, port)
+	builder := NewAttempt(kind, address, dialBudget)
 
-	deadline := time.Now().Add(time.Millisecond * 2000)
+	deadline := time.Now().Add(dialBudget)
 
 	var srvTLSConfig *tls.Config
 	if tlsConfig != nil {
@@ -36,7 +40,7 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 
 	dialResult, err := memd.DialMemdConn(address, srvTLSConfig, deadline)
 	if err != nil {
-		return nil, err
+		return nil, builder, err
 	}
 
 	var client MemdClient
@@ -44,26 +48,42 @@ func Dial(host string, port int, bucket, user, pass string, tlsConfig *tls.Confi
 	client.timing = dialResult.Timing
 	client.tlsState = dialResult.TLSState
 
+	// The connected address reached TLS when the dial negotiated it, otherwise only TCP
+	connectedPhase := PhaseTCP
+	if dialResult.TLSState != nil {
+		connectedPhase = PhaseTLS
+	}
+
+	// Record what the dial learned before authentication, so a later failure keeps it
+	builder.WithTiming(dialResult.Timing, 0).withAddresses(dialResult.Addresses, connectedPhase)
+
 	saslStart := time.Now()
 	err = client.auth(user, pass)
 	client.saslDuration = time.Since(saslStart)
+	builder.WithTiming(dialResult.Timing, client.saslDuration)
 	if err != nil {
 		client.Close()
-		return nil, err
+		return nil, builder, err
 	}
+
+	// Phase reached so far, in case selectBucket is skipped below
+	reached := PhaseSASL
 
 	if bucket != user {
 		err = client.selectBucket(bucket)
 		if err != nil {
 			client.Close()
-			return nil, err
+			return nil, builder, err
 		}
+
+		// selectBucket ran and succeeded: it is the furthest rung actually reached
+		reached = PhaseSelectBucket
 	}
 
 	// The dial deadline covered connect and auth, operations from here on carry their own
 	client.conn.SetDeadline(time.Time{})
 
-	return &client, nil
+	return &client, builder.withReached(reached), nil
 }
 
 // Close closes a connection
@@ -99,16 +119,16 @@ func (client *MemdClient) auth(user, pass string) error {
 		Opcode: memd.CmdSASLListMechs,
 	})
 	if err != nil {
-		return err
+		return NewPhaseError(PhaseSASL, Classify(PhaseSASL, err), err)
 	}
 
 	err = client.conn.ReadPacket(&resp)
 	if err != nil {
-		return err
+		return NewPhaseError(PhaseSASL, Classify(PhaseSASL, err), err)
 	}
 
 	if resp.Status != 0 {
-		return errors.New("unexpected SASLListMechs status")
+		return NewPhaseError(PhaseSASL, CategoryUnknown, errors.New("unexpected SASLListMechs status"))
 	}
 
 	mechs := strings.Split(string(resp.Value), " ")
@@ -121,7 +141,7 @@ func (client *MemdClient) auth(user, pass string) error {
 	}
 
 	if !foundPlainMech {
-		return errors.New("server does not support PLAIN SASL")
+		return NewPhaseError(PhaseSASL, CategoryUnknown, errors.New("server does not support PLAIN SASL"))
 	}
 
 	// Build PLAIN auth data
@@ -140,20 +160,24 @@ func (client *MemdClient) auth(user, pass string) error {
 		Value:  authData,
 	})
 	if err != nil {
-		return err
+		return NewPhaseError(PhaseSASL, Classify(PhaseSASL, err), err)
 	}
 
 	err = client.conn.ReadPacket(&resp)
 	if err != nil {
-		return err
+		return NewPhaseError(PhaseSASL, Classify(PhaseSASL, err), err)
 	}
 
+	// A failure here is an authentication failure whatever status carries it, so the status is
+	// not run through CategoryForMemdStatus: that maps the select-bucket meanings of KEY_ENOENT
+	// and EACCESS, which would report an auth failure as a bucket problem
 	if resp.Status != 0 {
 		if resp.Status == memd.StatusAuthError {
-			return errors.New("invalid bucket name/password")
+			return NewPhaseError(PhaseSASL, CategoryAuthRejected, errors.New("invalid bucket name/password"))
 		}
 
-		return fmt.Errorf("SASL auth failed for user `%s` (status: %d)", user, resp.Status)
+		return NewPhaseError(PhaseSASL, CategoryAuthRejected,
+			fmt.Errorf("SASL auth failed for user `%s` (status: %d)", user, resp.Status))
 	}
 
 	return nil
@@ -168,29 +192,31 @@ func (client *MemdClient) selectBucket(bucket string) error {
 		Key:    []byte(bucket),
 	})
 	if err != nil {
-		return err
+		return NewPhaseError(PhaseSelectBucket, Classify(PhaseSelectBucket, err), err)
 	}
 
 	err = client.conn.ReadPacket(&resp)
 	if err != nil {
-		return err
+		return NewPhaseError(PhaseSelectBucket, Classify(PhaseSelectBucket, err), err)
 	}
 
 	if resp.Status != 0 {
-		return fmt.Errorf("failed to select bucket `%s` (status: %d)", bucket, resp.Status)
+		return NewPhaseError(PhaseSelectBucket, CategoryForMemdStatus(resp.Status),
+			fmt.Errorf("failed to select bucket `%s` (status: %d)", bucket, resp.Status))
 	}
 
 	return nil
 }
 
-// opTimeout bounds a single operation, as a stalled peer would otherwise block the run forever
-const opTimeout = 2000 * time.Millisecond
+// OpTimeout bounds a single operation, as a stalled peer would otherwise block the run forever.
+// Exported so a caller sealing an attempt after an operation can report the budget it really had.
+const OpTimeout = 2000 * time.Millisecond
 
 // GetConfig will fetch a config via CCCP
 func (client *MemdClient) GetConfig() ([]byte, error) {
 	var resp memd.Response
 
-	client.conn.SetDeadline(time.Now().Add(opTimeout))
+	client.conn.SetDeadline(time.Now().Add(OpTimeout))
 	defer client.conn.SetDeadline(time.Time{})
 
 	err := client.conn.WritePacket(&memd.Request{
@@ -198,16 +224,17 @@ func (client *MemdClient) GetConfig() ([]byte, error) {
 		Opcode: memd.CmdGetClusterConfig,
 	})
 	if err != nil {
-		return nil, err
+		return nil, NewPhaseError(PhaseConfig, Classify(PhaseConfig, err), err)
 	}
 
 	err = client.conn.ReadPacket(&resp)
 	if err != nil {
-		return nil, err
+		return nil, NewPhaseError(PhaseConfig, Classify(PhaseConfig, err), err)
 	}
 
 	if resp.Status != memd.StatusSuccess {
-		return nil, fmt.Errorf("failed to get config (status: %d)", resp.Status)
+		return nil, NewPhaseError(PhaseConfig, CategoryForConfigStatus(resp.Status),
+			fmt.Errorf("failed to get config (status: %d)", resp.Status))
 	}
 
 	return resp.Value, nil
@@ -217,7 +244,7 @@ func (client *MemdClient) GetConfig() ([]byte, error) {
 func (client *MemdClient) Ping() error {
 	var resp memd.Response
 
-	client.conn.SetDeadline(time.Now().Add(opTimeout))
+	client.conn.SetDeadline(time.Now().Add(OpTimeout))
 	defer client.conn.SetDeadline(time.Time{})
 
 	err := client.conn.WritePacket(&memd.Request{

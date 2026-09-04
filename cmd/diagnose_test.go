@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/couchbaselabs/gocbconnstr"
 	"github.com/couchbaselabs/sdk-doctor/helpers"
 	"github.com/couchbaselabs/sdk-doctor/memd"
 )
@@ -115,6 +116,8 @@ func TestScanPortMatrixWarnsOnceForRefusedClientPorts(t *testing.T) {
 	internalPort, closeInternal := bindPort()
 	closeInternal()
 
+	defer saveGlobals()()
+
 	var out bytes.Buffer
 	gLog = helpers.Logger{}
 	gLog.SetOutput(&out)
@@ -164,6 +167,8 @@ func TestScanPortMatrixSkipsNodesNotAdvertisingAPort(t *testing.T) {
 
 	n1qlPort, closeN1ql := bindPort()
 	closeN1ql()
+
+	defer saveGlobals()()
 
 	var out bytes.Buffer
 	gLog = helpers.Logger{}
@@ -218,7 +223,7 @@ func TestTraceRequest(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", srv.URL, nil)
-	req, phases := traceRequest(req)
+	req, phases, _ := traceRequest(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -302,7 +307,7 @@ func TestHTTPProbeUnreachable(t *testing.T) {
 
 func TestTraceRequestPairsRacingConnects(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
-	req, phases := traceRequest(req)
+	req, phases, _ := traceRequest(req)
 
 	trace := httptrace.ContextClientTrace(req.Context())
 	trace.ConnectStart("tcp", "[::1]:8091")
@@ -318,7 +323,7 @@ func TestTraceRequestPairsRacingConnects(t *testing.T) {
 
 func TestTraceRequestLeavesFailedConnectUnstamped(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
-	req, phases := traceRequest(req)
+	req, phases, _ := traceRequest(req)
 
 	trace := httptrace.ContextClientTrace(req.Context())
 	trace.ConnectStart("tcp", "127.0.0.1:8091")
@@ -346,6 +351,8 @@ func TestScanPortMatrixReportsBothRefusalDiagnoses(t *testing.T) {
 	if probePort("::1", openPort, time.Second) != "refused" {
 		t.Skip("no usable IPv6 loopback to contrast against")
 	}
+
+	defer saveGlobals()()
 
 	var out bytes.Buffer
 	gLog = helpers.Logger{}
@@ -458,8 +465,7 @@ func TestNetworkFromTerseBucketConfigIsDeterministic(t *testing.T) {
 		}},
 	}
 
-	// Map iteration order is randomized per range, so a run without sorted keys would be
-	// unlikely to return the same network every time across enough repetitions
+	// Map order is randomized per range, so unsorted keys would not survive this many runs
 	for i := 0; i < 20; i++ {
 		if got := networkFromTerseBucketConfig(config); got != "external" {
 			t.Fatalf("run %d: expected the alphabetically-first match `external`, got `%s`", i, got)
@@ -467,26 +473,393 @@ func TestNetworkFromTerseBucketConfigIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestIsConnRefused(t *testing.T) {
+// A refusal never fires the connect hook, so the phase comes from the error, not the timing
+func TestFetchHTTPTerseBucketConfigReportsARefusedPortAsTCP(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %s", err)
 	}
-
-	addr := ln.Addr().String()
+	addr := ln.Addr().(*net.TCPAddr)
 	ln.Close()
 
-	_, refusedErr := net.DialTimeout("tcp", addr, time.Second)
+	_, refusedErr := net.DialTimeout("tcp", addr.String(), time.Second)
 	if refusedErr == nil {
 		t.Skip("the released port was taken by another listener")
 	}
 
-	if !isConnRefused(refusedErr) {
-		t.Fatalf("expected a refusal for %s, got %v", addr, refusedErr)
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig("127.0.0.1", addr.Port, "default", "u", "p", nil)
+	if err == nil {
+		t.Fatal("expected a connection-refused error, got nil")
 	}
 
-	_, dnsErr := net.DialTimeout("tcp", "no-such-host.invalid:80", time.Second)
-	if dnsErr == nil || isConnRefused(dnsErr) {
-		t.Fatalf("expected a lookup failure to not be a refusal, got %v", dnsErr)
+	if gotAttempt.Phase != string(helpers.PhaseTCP) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseTCP, err)
+	}
+	if gotAttempt.Category != string(helpers.CategoryTCPRefused) {
+		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryTCPRefused)
+	}
+}
+
+// TLSHandshakeDone is stamped even on failure, so "TLS finished" cannot mean "TLS succeeded"
+func TestFetchHTTPTerseBucketConfigReportsARejectedCertAsTLS(t *testing.T) {
+	srv := httptest.NewTLSServer(nil)
+	defer srv.Close()
+
+	host, portStr, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A default config verifies certificates, and this server's is in no trust store
+	tlsConfig := &tls.Config{}
+
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig(host, port, "default", "u", "p", tlsConfig)
+	if err == nil {
+		t.Fatal("expected a certificate verification error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseTLS) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseTLS, err)
+	}
+	if gotAttempt.Category != string(helpers.CategoryTLSVerify) {
+		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryTLSVerify)
+	}
+}
+
+// TCPDone is stamped only on a successful connect, so a hung server was still reached
+func TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+	defer ln.Close()
+
+	// Accept and never answer; the goroutine exits when the client drops the connection
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig("127.0.0.1", addr.Port, "default", "u", "p", nil)
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseResponse) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseResponse, err)
+	}
+
+	summary := bootstrapSummary([]helpers.Attempt{gotAttempt}, "default")
+	if strings.Contains(summary, "unreachable") {
+		t.Errorf("a hung server that completed the TCP handshake must not be reported as"+
+			" unreachable, got: %s", summary)
+	}
+}
+
+// Both HTTP paths decide here, so every branch is pinned rather than only the ones a caller hits
+func TestHTTPFailurePhase(t *testing.T) {
+	now := time.Now()
+
+	connected := memd.ConnectTiming{TCPStart: now, TCPDone: now}
+	handshaking := memd.ConnectTiming{TCPStart: now, TCPDone: now, TLSStart: now}
+
+	tests := []struct {
+		name             string
+		timing           memd.ConnectTiming
+		tlsHandshakeDone bool
+		err              error
+		want             helpers.Phase
+	}{
+		{"lookup failed", memd.ConnectTiming{}, false, &net.DNSError{Err: "no such host"}, helpers.PhaseDNS},
+		{"never connected", memd.ConnectTiming{TCPStart: now}, false, context.DeadlineExceeded, helpers.PhaseTCP},
+		{"handshake failed", handshaking, false, errors.New("bad certificate"), helpers.PhaseTLS},
+		{"handshake done, no answer", handshaking, true, context.DeadlineExceeded, helpers.PhaseResponse},
+		{"connected, no answer", connected, false, context.DeadlineExceeded, helpers.PhaseResponse},
+	}
+
+	for _, test := range tests {
+		got := httpFailurePhase(test.timing, test.tlsHandshakeDone, test.err)
+		if got != test.want {
+			t.Errorf("%s: phase = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+// Inferring from TLSStart alone blamed trust configuration for a cert the client had accepted
+func TestFetchHTTPTerseBucketConfigReportsAHungTLSServerAsResponse(t *testing.T) {
+	release := make(chan struct{})
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		// Outlive the fetcher's budget, so it times out with the handshake already behind it
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	parsed, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("failed to parse the test server URL: %s", err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatalf("failed to read the test server port: %s", err)
+	}
+
+	// The handshake must succeed here, so the server's certificate is accepted, not verified
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig(parsed.Hostname(), port, "default", "u", "p",
+		&tls.Config{InsecureSkipVerify: true})
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseResponse) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseResponse, err)
+	}
+	if gotAttempt.Category != string(helpers.CategoryResponseTimeout) {
+		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryResponseTimeout)
+	}
+
+	summary := bootstrapSummary([]helpers.Attempt{gotAttempt}, "default")
+	for _, wrong := range []string{"unreachable", "TLS handshake failed"} {
+		if strings.Contains(summary, wrong) {
+			t.Errorf("a server that completed its handshake and then stalled must not be"+
+				" reported with %q, got: %s", wrong, summary)
+		}
+	}
+
+	// An unranked category falls back to a generic line that would pass the checks above
+	if !strings.Contains(summary, "stopped responding") {
+		t.Errorf("expected the summary to name the stall, got: %s", summary)
+	}
+}
+
+// Rejecting this config aborted diagnosis, though every downstream consumer tolerates a nil thisNode
+func TestScanTerseConfigListStillUsesAConfigThatDescribesNoNodeOfItsOwn(t *testing.T) {
+	defer saveGlobals()()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
+	}
+
+	hosts := []gocbconnstr.Address{{Host: "hostA", Port: 8091}}
+	configs := []*terseBucketConfig{{
+		UUID:     "abc",
+		NodesExt: []bucketConfigNodeExt{{Hostname: "hostB", Services: map[string]int{"kv": 11210}}},
+	}}
+
+	got := scanTerseConfigList(hosts, configs)
+	if got == nil {
+		t.Fatal("expected the config to remain usable, got no master config")
+	}
+	if got.UUID != "abc" {
+		t.Errorf("selected config UUID = %q, want %q", got.UUID, "abc")
+	}
+
+	if !strings.Contains(out.String(), "does not identify which node") {
+		t.Errorf("expected the condition to be reported, got:\n%s", out.String())
+	}
+
+	// The fetch succeeded, so marking it failed would name a cause that did not occur
+	if got := gReport.Attempts[0].Category; got != "" {
+		t.Errorf("attempt category = %q, want it left unset", got)
+	}
+}
+
+// The whole point of keeping the config: it still yields a complete node list
+func TestScanTerseConfigListYieldsUsableNodesWithoutAThisNodeEntry(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+
+	hosts := []gocbconnstr.Address{{Host: "node1", Port: 8091}}
+	configs := []*terseBucketConfig{{
+		UUID: "abc",
+		NodesExt: []bucketConfigNodeExt{
+			{Hostname: "node1", Services: map[string]int{"kv": 11210, "mgmt": 8091}},
+			{Hostname: "node2", Services: map[string]int{"kv": 11210, "mgmt": 8091}},
+		},
+		SourceHost: "node1",
+		SourcePort: 8091,
+	}}
+
+	master := scanTerseConfigList(hosts, configs)
+	if master == nil {
+		t.Fatal("expected a usable master config")
+	}
+
+	if network := networkFromTerseBucketConfig(*master); network != "default" {
+		t.Errorf("network = %q, want %q", network, "default")
+	}
+
+	nodes := nodesFromMasterConfig(*master, "default")
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	}
+}
+
+// A host that returned nothing at all must not stop a later host's config from being used
+func TestScanTerseConfigListFallsThroughToTheNextUsableConfig(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+
+	hosts := []gocbconnstr.Address{{Host: "hostA", Port: 8091}, {Host: "hostB", Port: 8091}}
+	configs := []*terseBucketConfig{
+		nil,
+		{UUID: "def", NodesExt: []bucketConfigNodeExt{{ThisNode: true, Hostname: "hostB"}}},
+	}
+
+	got := scanTerseConfigList(hosts, configs)
+	if got == nil {
+		t.Fatal("expected the second host's config to be selected")
+	}
+	if got.UUID != "def" {
+		t.Errorf("selected config UUID = %q, want the second host's %q", got.UUID, "def")
+	}
+}
+
+// Every attempt succeeds in this case, so without a report the run names no cause at all
+func TestNodesFromMasterConfigReportsAMissingAlternateNetwork(t *testing.T) {
+	defer saveGlobals()()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
+	}
+
+	config := terseBucketConfig{
+		SourceHost: "hostA",
+		SourcePort: 8091,
+		NodesExt: []bucketConfigNodeExt{
+			{ThisNode: true, Hostname: "hostA", Services: map[string]int{"kv": 11210},
+				AlternateNames: map[string]bucketConfigAlternateNames{
+					"external": {Hostname: "ext-a"},
+				}},
+			// This node advertises no external address, so the list cannot be completed
+			{Hostname: "hostB", Services: map[string]int{"kv": 11210}},
+		},
+	}
+
+	if got := nodesFromMasterConfig(config, "external"); got != nil {
+		t.Errorf("expected no node list, got %+v", got)
+	}
+
+	if !strings.Contains(out.String(), "does not describe the `external` network") {
+		t.Errorf("expected the missing network to be reported, got:\n%s", out.String())
+	}
+
+	if got := gReport.Attempts[0].Category; got != string(helpers.CategoryConfigInvalid) {
+		t.Errorf("attempt category = %q, want %q", got, helpers.CategoryConfigInvalid)
+	}
+
+	summary := bootstrapSummary(gReport.Attempts, "travel")
+	if !strings.Contains(summary, "could not use") {
+		t.Errorf("expected the summary to name the unusable configuration, got: %s", summary)
+	}
+}
+
+// The default network needs no alternate entry, so the same config yields every node
+func TestNodesFromMasterConfigKeepsTheDefaultNetwork(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+
+	config := terseBucketConfig{
+		SourceHost: "hostA",
+		NodesExt: []bucketConfigNodeExt{
+			{ThisNode: true, Hostname: "hostA"},
+			{Hostname: "hostB"},
+		},
+	}
+
+	if got := nodesFromMasterConfig(config, "default"); len(got) != 2 {
+		t.Errorf("expected both nodes, got %+v", got)
+	}
+}
+
+// A config describing no nodes at all is empty, not a config whose network is missing
+func TestNodesFromMasterConfigReportsAConfigWithNoNodesAsEmpty(t *testing.T) {
+	defer saveGlobals()()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
+	}
+
+	config := terseBucketConfig{
+		UUID:       "abc",
+		NodesExt:   nil,
+		SourceHost: "hostA",
+		SourcePort: 8091,
+	}
+
+	if nodes := nodesFromMasterConfig(config, "default"); nodes != nil {
+		t.Fatalf("expected no node list, got %+v", nodes)
+	}
+
+	if !strings.Contains(out.String(), "describes no nodes") {
+		t.Errorf("expected an empty-config report, got:\n%s", out.String())
+	}
+
+	if got := gReport.Attempts[0].Category; got != string(helpers.CategoryConfigEmpty) {
+		t.Errorf("attempt category = %q, want %q", got, helpers.CategoryConfigEmpty)
+	}
+}
+
+// Splitting the endpoint only to rejoin it mangles anything net.SplitHostPort cannot parse
+func TestLogConnectPhasesPrintsTheEndpointVerbatim(t *testing.T) {
+	defer saveGlobals()()
+
+	for _, endpoint := range []string{"[::1]:11210", "::1:11210", "node1:11210"} {
+		var out bytes.Buffer
+		gLog = helpers.Logger{}
+		gLog.SetOutput(&out)
+		gReport = diagnosticReport{}
+
+		logConnectPhases(helpers.Attempt{
+			Kind:     "service-kv",
+			Endpoint: endpoint,
+			TCP:      "1ms",
+		}, memd.ConnectTiming{})
+
+		want := "Connect phases for `" + endpoint + "`:"
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("expected %q, got:\n%s", want, out.String())
+		}
 	}
 }
