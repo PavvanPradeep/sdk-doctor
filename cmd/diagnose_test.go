@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/couchbaselabs/gocbconnstr"
 	"github.com/couchbaselabs/sdk-doctor/helpers"
 	"github.com/couchbaselabs/sdk-doctor/memd"
 )
@@ -115,6 +116,8 @@ func TestScanPortMatrixWarnsOnceForRefusedClientPorts(t *testing.T) {
 	internalPort, closeInternal := bindPort()
 	closeInternal()
 
+	defer saveGlobals()()
+
 	var out bytes.Buffer
 	gLog = helpers.Logger{}
 	gLog.SetOutput(&out)
@@ -164,6 +167,8 @@ func TestScanPortMatrixSkipsNodesNotAdvertisingAPort(t *testing.T) {
 
 	n1qlPort, closeN1ql := bindPort()
 	closeN1ql()
+
+	defer saveGlobals()()
 
 	var out bytes.Buffer
 	gLog = helpers.Logger{}
@@ -218,7 +223,7 @@ func TestTraceRequest(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", srv.URL, nil)
-	req, phases := traceRequest(req)
+	req, phases, _ := traceRequest(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -302,7 +307,7 @@ func TestHTTPProbeUnreachable(t *testing.T) {
 
 func TestTraceRequestPairsRacingConnects(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
-	req, phases := traceRequest(req)
+	req, phases, _ := traceRequest(req)
 
 	trace := httptrace.ContextClientTrace(req.Context())
 	trace.ConnectStart("tcp", "[::1]:8091")
@@ -318,7 +323,7 @@ func TestTraceRequestPairsRacingConnects(t *testing.T) {
 
 func TestTraceRequestLeavesFailedConnectUnstamped(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
-	req, phases := traceRequest(req)
+	req, phases, _ := traceRequest(req)
 
 	trace := httptrace.ContextClientTrace(req.Context())
 	trace.ConnectStart("tcp", "127.0.0.1:8091")
@@ -346,6 +351,8 @@ func TestScanPortMatrixReportsBothRefusalDiagnoses(t *testing.T) {
 	if probePort("::1", openPort, time.Second) != "refused" {
 		t.Skip("no usable IPv6 loopback to contrast against")
 	}
+
+	defer saveGlobals()()
 
 	var out bytes.Buffer
 	gLog = helpers.Logger{}
@@ -467,30 +474,6 @@ func TestNetworkFromTerseBucketConfigIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestIsConnRefused(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %s", err)
-	}
-
-	addr := ln.Addr().String()
-	ln.Close()
-
-	_, refusedErr := net.DialTimeout("tcp", addr, time.Second)
-	if refusedErr == nil {
-		t.Skip("the released port was taken by another listener")
-	}
-
-	if !isConnRefused(refusedErr) {
-		t.Fatalf("expected a refusal for %s, got %v", addr, refusedErr)
-	}
-
-	_, dnsErr := net.DialTimeout("tcp", "no-such-host.invalid:80", time.Second)
-	if dnsErr == nil || isConnRefused(dnsErr) {
-		t.Fatalf("expected a lookup failure to not be a refusal, got %v", dnsErr)
-	}
-}
-
 // A refused TCP connection must be reported at the TCP phase, not the DNS phase: the
 // httptrace hook that would otherwise prove a successful connect never fires on a
 // refusal, so the phase has to be inferred from the error itself, not from timing alone.
@@ -601,5 +584,218 @@ func TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse(t *testing.T) {
 	if strings.Contains(summary, "unreachable") {
 		t.Errorf("a hung server that completed the TCP handshake must not be reported as"+
 			" unreachable, got: %s", summary)
+	}
+}
+
+// httpFailurePhase is where both HTTP paths - the bootstrap config fetch and the service
+// probe - decide what a failed request means, so its four branches are pinned here rather
+// than only through whichever caller happens to exercise one. The TLS branch is the reason
+// this function takes the handshake's outcome as an argument: httptrace fires
+// TLSHandshakeDone on failure too, so a timing struct alone cannot tell a rejected
+// certificate from a handshake that succeeded before the request stalled.
+func TestHTTPFailurePhase(t *testing.T) {
+	now := time.Now()
+
+	connected := memd.ConnectTiming{TCPStart: now, TCPDone: now}
+	handshaking := memd.ConnectTiming{TCPStart: now, TCPDone: now, TLSStart: now}
+
+	tests := []struct {
+		name             string
+		timing           memd.ConnectTiming
+		tlsHandshakeDone bool
+		err              error
+		want             helpers.Phase
+	}{
+		{"lookup failed", memd.ConnectTiming{}, false, &net.DNSError{Err: "no such host"}, helpers.PhaseDNS},
+		{"never connected", memd.ConnectTiming{TCPStart: now}, false, context.DeadlineExceeded, helpers.PhaseTCP},
+		{"handshake failed", handshaking, false, errors.New("bad certificate"), helpers.PhaseTLS},
+		{"handshake done, no answer", handshaking, true, context.DeadlineExceeded, helpers.PhaseResponse},
+		{"connected, no answer", connected, false, context.DeadlineExceeded, helpers.PhaseResponse},
+	}
+
+	for _, test := range tests {
+		got := httpFailurePhase(test.timing, test.tlsHandshakeDone, test.err)
+		if got != test.want {
+			t.Errorf("%s: phase = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+// The TLS counterpart of TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse: a
+// server that completes the handshake and then never answers must be reported at the
+// response phase. Inferring the phase from TLSStart alone reported this as a failed TLS
+// handshake - naming trust configuration as the cause for a node whose certificate the
+// client had already accepted, and sending the reader to the wrong problem entirely.
+func TestFetchHTTPTerseBucketConfigReportsAHungTLSServerAsResponse(t *testing.T) {
+	release := make(chan struct{})
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		// Outlive the fetcher's own budget, so the request times out with the handshake
+		//  already behind it
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	parsed, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("failed to parse the test server URL: %s", err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatalf("failed to read the test server port: %s", err)
+	}
+
+	// The handshake must succeed for this test to be about anything, so the server's own
+	//  certificate is accepted rather than verified
+	_, gotAttempt, err := fetchHTTPTerseBucketConfig(parsed.Hostname(), port, "default", "u", "p",
+		&tls.Config{InsecureSkipVerify: true})
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+
+	if gotAttempt.Phase != string(helpers.PhaseResponse) {
+		t.Errorf("phase = %q, want %q (err was: %v)", gotAttempt.Phase, helpers.PhaseResponse, err)
+	}
+	if gotAttempt.Category != string(helpers.CategoryResponseTimeout) {
+		t.Errorf("category = %q, want %q", gotAttempt.Category, helpers.CategoryResponseTimeout)
+	}
+
+	summary := bootstrapSummary([]helpers.Attempt{gotAttempt}, "default")
+	for _, wrong := range []string{"unreachable", "TLS handshake failed"} {
+		if strings.Contains(summary, wrong) {
+			t.Errorf("a server that completed its handshake and then stalled must not be"+
+				" reported with %q, got: %s", wrong, summary)
+		}
+	}
+
+	// Naming the cause, not merely avoiding the wrong ones: a category the summary does
+	//  not rank falls back to a generic "none returned a usable configuration" line, which
+	//  passes the checks above while telling the reader nothing about the stall
+	if !strings.Contains(summary, "stopped responding") {
+		t.Errorf("expected the summary to name the stall, got: %s", summary)
+	}
+}
+
+// A configuration that does not describe its own node cannot be used: the doctor has no
+// way to tell which of the nodes it lists is the one that answered, which is what network
+// selection and every node-local check are keyed on. Selecting it as the master config and
+// only then rejecting it printed "it cannot be used" and went on to use it anyway.
+func TestScanTerseConfigListRejectsAConfigThatDescribesNoNodeOfItsOwn(t *testing.T) {
+	defer saveGlobals()()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
+	}
+
+	hosts := []gocbconnstr.Address{{Host: "hostA", Port: 8091}}
+	configs := []*terseBucketConfig{{
+		UUID:     "abc",
+		NodesExt: []bucketConfigNodeExt{{Hostname: "hostB", Services: map[string]int{"kv": 11210}}},
+	}}
+
+	if got := scanTerseConfigList(hosts, configs); got != nil {
+		t.Errorf("expected no usable master config, got %+v", got)
+	}
+
+	if !strings.Contains(out.String(), "does not describe the node") {
+		t.Errorf("expected the rejection to be reported, got:\n%s", out.String())
+	}
+
+	if got := gReport.Attempts[0].Category; got != string(helpers.CategoryConfigEmpty) {
+		t.Errorf("attempt category = %q, want %q", got, helpers.CategoryConfigEmpty)
+	}
+}
+
+// A later host's good configuration must still be usable after an earlier one was rejected
+func TestScanTerseConfigListFallsThroughToTheNextUsableConfig(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+
+	hosts := []gocbconnstr.Address{{Host: "hostA", Port: 8091}, {Host: "hostB", Port: 8091}}
+	configs := []*terseBucketConfig{
+		{UUID: "abc", NodesExt: []bucketConfigNodeExt{{Hostname: "hostZ"}}},
+		{UUID: "def", NodesExt: []bucketConfigNodeExt{{ThisNode: true, Hostname: "hostB"}}},
+	}
+
+	got := scanTerseConfigList(hosts, configs)
+	if got == nil {
+		t.Fatal("expected the second host's config to be selected")
+	}
+	if got.UUID != "def" {
+		t.Errorf("selected config UUID = %q, want the second host's %q", got.UUID, "def")
+	}
+}
+
+// clusterNodesFromTerseBucketConfig returns nil when a node carries no entry for the
+// selected alternate network. Every bootstrap attempt succeeded in that case, so without
+// a report here the run failed bootstrap while naming no cause at all.
+func TestNodesFromMasterConfigReportsAMissingAlternateNetwork(t *testing.T) {
+	defer saveGlobals()()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
+	}
+
+	config := terseBucketConfig{
+		SourceHost: "hostA",
+		SourcePort: 8091,
+		NodesExt: []bucketConfigNodeExt{
+			{ThisNode: true, Hostname: "hostA", Services: map[string]int{"kv": 11210},
+				AlternateNames: map[string]bucketConfigAlternateNames{
+					"external": {Hostname: "ext-a"},
+				}},
+			// This node advertises no external address, so the list cannot be completed
+			{Hostname: "hostB", Services: map[string]int{"kv": 11210}},
+		},
+	}
+
+	if got := nodesFromMasterConfig(config, "external"); got != nil {
+		t.Errorf("expected no node list, got %+v", got)
+	}
+
+	if !strings.Contains(out.String(), "does not describe the `external` network") {
+		t.Errorf("expected the missing network to be reported, got:\n%s", out.String())
+	}
+
+	if got := gReport.Attempts[0].Category; got != string(helpers.CategoryConfigInvalid) {
+		t.Errorf("attempt category = %q, want %q", got, helpers.CategoryConfigInvalid)
+	}
+
+	summary := bootstrapSummary(gReport.Attempts, "travel")
+	if !strings.Contains(summary, "could not use") {
+		t.Errorf("expected the summary to name the unusable configuration, got: %s", summary)
+	}
+}
+
+// The default network needs no alternate entry, so the same config yields every node
+func TestNodesFromMasterConfigKeepsTheDefaultNetwork(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+
+	config := terseBucketConfig{
+		SourceHost: "hostA",
+		NodesExt: []bucketConfigNodeExt{
+			{ThisNode: true, Hostname: "hostA"},
+			{Hostname: "hostB"},
+		},
+	}
+
+	if got := nodesFromMasterConfig(config, "default"); len(got) != 2 {
+		t.Errorf("expected both nodes, got %+v", got)
 	}
 }

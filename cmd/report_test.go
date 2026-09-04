@@ -13,6 +13,8 @@ import (
 )
 
 func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
+	defer saveGlobals()()
+
 	gLog = helpers.Logger{}
 	gLog.SetOutput(ioutil.Discard)
 	gReport = diagnosticReport{ConnectionString: "couchbases://node1"}
@@ -86,6 +88,8 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 }
 
 func TestLogConnectPhasesWithoutDNSOrTLS(t *testing.T) {
+	defer saveGlobals()()
+
 	var out strings.Builder
 	gLog = helpers.Logger{}
 	gLog.SetOutput(&out)
@@ -116,6 +120,8 @@ func TestLogConnectPhasesWithoutDNSOrTLS(t *testing.T) {
 // keep-alive HTTP connection produces exactly this shape. Only the phases log line is
 // skipped, since there is nothing to format without a TCP timing.
 func TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP(t *testing.T) {
+	defer saveGlobals()()
+
 	var out strings.Builder
 	gLog = helpers.Logger{}
 	gLog.SetOutput(&out)
@@ -142,6 +148,8 @@ func TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP(t *testing.T) {
 //	testMemdService/testHTTPService closures in diagnose.go, which have no seam reachable
 //	from a unit test); it only pins that the pipeline is not where such a bug could hide.
 func TestLogConnectPhasesPreservesTheAttemptKindVerbatim(t *testing.T) {
+	defer saveGlobals()()
+
 	gLog = helpers.Logger{}
 	gLog.SetOutput(ioutil.Discard)
 	gReport = diagnosticReport{}

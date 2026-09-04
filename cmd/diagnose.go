@@ -137,9 +137,15 @@ func tcpSlowerThanDNS(timing memd.ConnectTiming) bool {
 	return timing.TCP() > 20*time.Millisecond && timing.DNS() > 0 && timing.TCP() > 5*timing.DNS()
 }
 
-func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming) {
+// traceRequest instruments req and returns accessors for what the trace learned: the
+//
+//	per-phase timing, and whether the TLS handshake ran to completion.  The second is
+//	needed because the handshake callback fires on failure too, so TLSDone alone cannot
+//	tell a rejected certificate from a handshake that succeeded before the request stalled.
+func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming, func() bool) {
 	var lock sync.Mutex
 	var timing memd.ConnectTiming
+	var tlsHandshakeDone bool
 
 	stamp := func(phase *time.Time) {
 		lock.Lock()
@@ -173,7 +179,14 @@ func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming) 
 		ConnectStart:      connectStart,
 		ConnectDone:       connectDone,
 		TLSHandshakeStart: func() { stamp(&timing.TLSStart) },
-		TLSHandshakeDone:  func(tls.ConnectionState, error) { stamp(&timing.TLSDone) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			lock.Lock()
+			timing.TLSDone = time.Now()
+			// The callback fires whether the handshake succeeded or failed, so its error
+			//  is the only signal that separates the two
+			tlsHandshakeDone = err == nil
+			lock.Unlock()
+		},
 	}
 
 	read := func() memd.ConnectTiming {
@@ -183,7 +196,35 @@ func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming) 
 		return timing
 	}
 
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), read
+	handshaken := func() bool {
+		lock.Lock()
+		defer lock.Unlock()
+
+		return tlsHandshakeDone
+	}
+
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), read, handshaken
+}
+
+// httpFailurePhase names the phase a failed HTTP request died in.  The trace is the only
+//
+//	honest source: connectDone stamps the TCP phase only when a connect succeeds, and the
+//	handshake reports its own outcome, so a request whose certificate was rejected and one
+//	that completed TLS and then waited for an answer that never came are told apart
+//	without matching on error text.
+func httpFailurePhase(timing memd.ConnectTiming, tlsHandshakeDone bool, err error) helpers.Phase {
+	var dnsErr *net.DNSError
+
+	switch {
+	case errors.As(err, &dnsErr):
+		return helpers.PhaseDNS
+	case !timing.TLSStart.IsZero() && !tlsHandshakeDone:
+		return helpers.PhaseTLS
+	case !timing.TCPDone.IsZero():
+		return helpers.PhaseResponse
+	default:
+		return helpers.PhaseTCP
+	}
 }
 
 // diagnoseCmd represents the diagnose command
@@ -441,6 +482,88 @@ func clusterNodesFromTerseBucketConfig(config terseBucketConfig, networkType str
 	return out
 }
 
+// scanTerseConfigList scans a list of hosts and the configurations they returned, logs any
+//
+//	appropriate warnings, and returns the first usable configuration it encounters (or nil
+//	if there is none).  Package-level rather than a closure inside diagnose so that the
+//	selection rules below are reachable from a test.
+func scanTerseConfigList(hosts []gocbconnstr.Address, configs []*terseBucketConfig) *terseBucketConfig {
+	if len(hosts) != len(configs) {
+		panic(0)
+	}
+
+	var masterConfig *terseBucketConfig
+
+	for i, target := range hosts {
+		config := configs[i]
+
+		if config == nil {
+			continue
+		}
+
+		// Checked before the config can become the master, so the error below and the
+		//  category it records describe what the run actually does.  Selecting it first and
+		//  rejecting it afterwards would report a configuration as unusable and then go on
+		//  to use it.
+		thisNodeExt := config.GetSourceNodeExt()
+		if thisNodeExt == nil {
+			gLog.Error(
+				"Bootstrap host `%s` returned a configuration that does not describe the node"+
+					" itself, so it cannot be used.",
+				target.Host)
+
+			markAttemptCategory(fmt.Sprintf("%s:%d", target.Host, target.Port), helpers.CategoryConfigEmpty)
+
+			continue
+		}
+
+		if masterConfig == nil {
+			masterConfig = config
+		} else {
+			if config.UUID != masterConfig.UUID {
+				gLog.Error(
+					"Boostrap host `%s` appears to be pointing to a different cluster.  Tests"+
+						" will be running against the first successfully connected node in your"+
+						" bootstrap list, as a client would behave.",
+					target.Host)
+			}
+		}
+
+		if thisNodeExt.Hostname != "" && target.Host != thisNodeExt.Hostname {
+			gLog.Warn(
+				"Bootstrap host `%s` is not using the canonical node hostname of `%s`.  This"+
+					" is not neccessarily an error, but has been known to result in strange and"+
+					" challenging to diagnose errors when DNS entries are reconfigured.",
+				target.Host, thisNodeExt.Hostname)
+		}
+	}
+
+	return masterConfig
+}
+
+// nodesFromMasterConfig turns the chosen configuration into the node list, reporting the
+//
+//	one way that comes back empty: a node carrying no entry for the selected alternate
+//	network leaves the doctor with no address it can legitimately use for that node, and
+//	rejecting the whole list is the only safe answer.  Without the report here the run
+//	would fail bootstrap having named no cause at all, since every attempt succeeded.
+func nodesFromMasterConfig(config terseBucketConfig, networkType string) []clusterNode {
+	nodes := clusterNodesFromTerseBucketConfig(config, networkType)
+	if nodes != nil {
+		return nodes
+	}
+
+	gLog.Error(
+		"The configuration from `%s:%d` does not describe the `%s` network on every node,"+
+			" so no usable node list could be built from it.",
+		config.SourceHost, config.SourcePort, networkType)
+
+	markAttemptCategory(fmt.Sprintf("%s:%d", config.SourceHost, config.SourcePort),
+		helpers.CategoryConfigInvalid)
+
+	return nil
+}
+
 func networkFromTerseBucketConfig(config terseBucketConfig) string {
 	thisNode := config.GetSourceNodeExt()
 	if thisNode == nil {
@@ -501,6 +624,12 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 // httpConfigBudget bounds a single config fetch over HTTP
 const httpConfigBudget = 2000 * time.Millisecond
 
+// serviceProbeBudget bounds a single service connectivity probe.  The HTTP probe's client
+//
+//	timeout and the budget its attempt record reports are the same number by construction,
+//	so a change to one cannot silently leave the report describing the other.
+const serviceProbeBudget = 2000 * time.Millisecond
+
 func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, helpers.Attempt, error) {
 	if user == "" {
 		user = bucket
@@ -527,23 +656,12 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	req.SetBasicAuth(user, pass)
 
 	// The same tracer the HTTP service probe uses, so both paths report the same phases
-	req, phases := traceRequest(req)
+	req, phases, tlsHandshakeDone := traceRequest(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		timing := phases()
-
-		phase := helpers.PhaseTCP
-
-		var dnsErr *net.DNSError
-		switch {
-		case errors.As(err, &dnsErr):
-			phase = helpers.PhaseDNS
-		case !timing.TLSStart.IsZero():
-			phase = helpers.PhaseTLS
-		case !timing.TCPDone.IsZero():
-			phase = helpers.PhaseResponse
-		}
+		phase := httpFailurePhase(timing, tlsHandshakeDone(), err)
 
 		attempt := builder.WithTiming(timing, 0).Finish(phase, helpers.Classify(phase, err), err)
 
@@ -687,12 +805,6 @@ func matrixPorts(nodes []clusterNode, useTLS bool) []portDef {
 	return ports
 }
 
-// isConnRefused reports whether the peer answered with a refusal, which proves the
-// packets reached it and nothing was listening
-func isConnRefused(err error) bool {
-	return helpers.IsConnRefused(err)
-}
-
 func probePort(host string, port int, timeout time.Duration) string {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err == nil {
@@ -700,7 +812,7 @@ func probePort(host string, port int, timeout time.Duration) string {
 		return "open"
 	}
 
-	if isConnRefused(err) {
+	if helpers.IsConnRefused(err) {
 		return "refused"
 	}
 
@@ -1121,58 +1233,6 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	var selectedNetwork string
 	var configSource string
 
-	// Scans a list of hosts and configurations and logs any appropriate warnings then returns
-	//  the first good configuration that it actually encounters (or nil if none are found).
-	scanTerseConfigList := func(hosts []gocbconnstr.Address, configs []*terseBucketConfig) *terseBucketConfig {
-		if len(hosts) != len(configs) {
-			panic(0)
-		}
-
-		var masterConfig *terseBucketConfig
-
-		for i, target := range hosts {
-			config := configs[i]
-
-			if config == nil {
-				continue
-			}
-
-			if masterConfig == nil {
-				masterConfig = config
-			} else {
-				if config.UUID != masterConfig.UUID {
-					gLog.Error(
-						"Boostrap host `%s` appears to be pointing to a different cluster.  Tests"+
-							" will be running against the first successfully connected node in your"+
-							" bootstrap list, as a client would behave.",
-						target.Host)
-				}
-			}
-
-			thisNodeExt := config.GetSourceNodeExt()
-			if thisNodeExt == nil {
-				gLog.Error(
-					"Bootstrap host `%s` returned a configuration that does not describe the node"+
-						" itself, so it cannot be used.",
-					target.Host)
-
-				markAttemptCategory(fmt.Sprintf("%s:%d", target.Host, target.Port), helpers.CategoryConfigEmpty)
-
-				continue
-			}
-
-			if thisNodeExt.Hostname != "" && target.Host != thisNodeExt.Hostname {
-				gLog.Warn(
-					"Bootstrap host `%s` is not using the canonical node hostname of `%s`.  This"+
-						" is not neccessarily an error, but has been known to result in strange and"+
-						" challenging to diagnose errors when DNS entries are reconfigured.",
-					target.Host, thisNodeExt.Hostname)
-			}
-		}
-
-		return masterConfig
-	}
-
 	// Attempt to bootstrap via CCCP
 	if nodesList == nil {
 		if len(resConnSpec.MemdHosts) == 0 {
@@ -1204,7 +1264,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				if selectedNetwork == "" {
 					selectedNetwork = networkFromTerseBucketConfig(*masterConfig)
 				}
-				nodesList = clusterNodesFromTerseBucketConfig(*masterConfig, selectedNetwork)
+				nodesList = nodesFromMasterConfig(*masterConfig, selectedNetwork)
 				configSource = "cccp"
 			}
 		}
@@ -1241,7 +1301,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				if selectedNetwork == "" {
 					selectedNetwork = networkFromTerseBucketConfig(*masterConfig)
 				}
-				nodesList = clusterNodesFromTerseBucketConfig(*masterConfig, selectedNetwork)
+				nodesList = nodesFromMasterConfig(*masterConfig, selectedNetwork)
 				configSource = "http-terse"
 			}
 		}
@@ -1418,7 +1478,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	}
 	testHTTPClient := &http.Client{
 		Transport: testHTTPTransport,
-		Timeout:   2000 * time.Millisecond,
+		Timeout:   serviceProbeBudget,
 	}
 
 	testMemdService := func(node clusterNode, svcName, svcKeyPlain, svcKeySSL string) {
@@ -1435,7 +1495,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				recordAttempt(builder.FromDial(err))
 
 				svcFailed++
-				if isConnRefused(err) {
+				if helpers.IsConnRefused(err) {
 					svcRefused++
 				} else if isDialFailure(err) {
 					svcUnreachable++
@@ -1473,20 +1533,26 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			// No credentials are set here since we only care that the service responds,
 			//  not that it responds with anything in particular.
 
-			req, phases := traceRequest(req)
+			req, phases, tlsHandshakeDone := traceRequest(req)
 
 			builder := helpers.NewAttempt("service-"+svcKeyPlain,
-				fmt.Sprintf("%s:%d", node.Hostname, svcPort), 2000*time.Millisecond)
+				fmt.Sprintf("%s:%d", node.Hostname, svcPort), serviceProbeBudget)
 
 			resp, err := testHTTPClient.Do(req)
 			if err != nil {
-				recordAttempt(builder.WithTiming(phases(), 0).
-					Finish(helpers.PhaseTCP, helpers.Classify(helpers.PhaseTCP, err), err))
+				// The same phase inference the bootstrap fetcher uses, so a rejected
+				//  certificate or a failed lookup on a service endpoint is recorded at the
+				//  phase it actually happened in rather than always at tcp
+				timing := phases()
+				phase := httpFailurePhase(timing, tlsHandshakeDone(), err)
+
+				recordAttempt(builder.WithTiming(timing, 0).
+					Finish(phase, helpers.Classify(phase, err), err))
 
 				svcFailed++
-				if isConnRefused(err) {
+				if helpers.IsConnRefused(err) {
 					svcRefused++
-				} else if httpProbeUnreachable(err, phases()) {
+				} else if httpProbeUnreachable(err, timing) {
 					svcUnreachable++
 				} else if tlsConfig != nil && !tlsReported[node.Hostname] {
 					tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)

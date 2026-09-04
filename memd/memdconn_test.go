@@ -99,8 +99,25 @@ func TestReadDeadlineBoundsAStalledPeer(t *testing.T) {
 	}
 }
 
+// unresolvableHost is reserved by RFC 6761 so that it can never resolve.  A wildcard
+// resolver or a captive portal answers for it regardless, and a test cannot control the
+// environment's resolver - so the tests below skip rather than fail when the name resolves,
+// since resolution succeeding means the failure they are about never happened.
+const unresolvableHost = "this-host-does-not-resolve.invalid"
+
+func requireUnresolvable(t *testing.T) {
+	t.Helper()
+
+	if _, err := net.LookupHost(unresolvableHost); err == nil {
+		t.Skipf("this resolver answers for %q, so a resolution failure cannot be provoked here",
+			unresolvableHost)
+	}
+}
+
 func TestDialMemdConnUnknownHost(t *testing.T) {
-	_, err := DialMemdConn("this-host-does-not-resolve.invalid:11210", nil, time.Now().Add(2*time.Second))
+	requireUnresolvable(t)
+
+	_, err := DialMemdConn(unresolvableHost+":11210", nil, time.Now().Add(2*time.Second))
 	if err == nil {
 		t.Fatal("expected an error dialing an unresolvable host, got nil")
 	}
@@ -140,7 +157,9 @@ func TestAttemptDeadlineSplitsTheTimeLeft(t *testing.T) {
 }
 
 func TestDialMemdConnUnresolvableHostCarriesDNSDiagnostics(t *testing.T) {
-	result, err := DialMemdConn("this-host-does-not-resolve.invalid:11210", nil, time.Now().Add(2*time.Second))
+	requireUnresolvable(t)
+
+	result, err := DialMemdConn(unresolvableHost+":11210", nil, time.Now().Add(2*time.Second))
 	if err == nil {
 		t.Fatal("expected an error dialing an unresolvable host, got nil")
 	}

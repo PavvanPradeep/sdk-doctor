@@ -22,15 +22,19 @@ func recordAttempt(attempt helpers.Attempt) {
 // markAttemptCategory downgrades an already-recorded attempt whose configuration turned
 //
 //	out to be unusable, which is only discovered after the fetch returned successfully.
-//	endpoint is matched exactly (not by host prefix) and only the first uncategorized
-//	match is amended, so a host that appears more than once in the report — the same
-//	hostname bootstrapped over both CCCP and HTTP, say — cannot have an unrelated
-//	attempt's outcome overwritten by this one's.
+//	endpoint is matched exactly (not by host prefix) and only a successful config fetch
+//	is amended, so a host that appears more than once in the report — the same hostname
+//	bootstrapped over both CCCP and HTTP, say — cannot have an unrelated attempt's
+//	outcome overwritten by this one's.  Success is identified positively, by the config
+//	phase with no category, rather than by an empty category alone: that keeps the match
+//	pinned to the one record this can honestly downgrade even if some future path ever
+//	seals a failure without naming a cause.
 func markAttemptCategory(endpoint string, category helpers.Category) {
 	for i := range gReport.Attempts {
 		attempt := &gReport.Attempts[i]
 
-		if attempt.Category != "" || attempt.Endpoint != endpoint {
+		reachedConfig := attempt.Phase == string(helpers.PhaseConfig) && attempt.Category == ""
+		if !reachedConfig || attempt.Endpoint != endpoint {
 			continue
 		}
 
@@ -71,6 +75,7 @@ var categoryRank = []helpers.Category{
 	helpers.CategoryBucketNotFound,
 	helpers.CategoryTLSVerify,
 	helpers.CategoryTLSHandshake,
+	helpers.CategoryResponseTimeout,
 	helpers.CategoryCCCPUnsupported,
 	helpers.CategoryConfigInvalid,
 	helpers.CategoryConfigEmpty,
@@ -167,6 +172,10 @@ func bootstrapSummary(attempts []helpers.Attempt, bucket string) string {
 	case helpers.CategoryTLSHandshake:
 		summary = fmt.Sprintf(
 			"The TLS handshake failed on %d of %d endpoints; those endpoints were reachable.", hit, total)
+	case helpers.CategoryResponseTimeout:
+		summary = fmt.Sprintf(
+			"%d of %d endpoints accepted the connection then stopped responding before"+
+				" returning a configuration.", hit, total)
 	case helpers.CategoryCCCPUnsupported:
 		summary = fmt.Sprintf(
 			"%d of %d endpoints authenticated but returned no cluster configuration.", hit, total)

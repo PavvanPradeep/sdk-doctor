@@ -236,7 +236,7 @@ func (client *MemdClient) GetConfig() ([]byte, error) {
 	}
 
 	if resp.Status != memd.StatusSuccess {
-		return nil, NewPhaseError(PhaseConfig, CategoryCCCPUnsupported,
+		return nil, NewPhaseError(PhaseConfig, CategoryForConfigStatus(resp.Status),
 			fmt.Errorf("failed to get config (status: %d)", resp.Status))
 	}
 

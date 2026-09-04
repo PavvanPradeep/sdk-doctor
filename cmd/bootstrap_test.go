@@ -365,12 +365,16 @@ func TestReachedPastTCP(t *testing.T) {
 // markAttemptCategory must amend only the endpoint it names. A host bootstrapped over
 // both CCCP and HTTP produces two attempts sharing a hostname on different ports; a
 // match keyed on the endpoint's host alone would stamp both, mislabeling whichever one
-// actually succeeded.
+// actually succeeded. Both fixtures are sealed the way a successful fetch really is -
+// the config phase with no category, which is what both transports record on success -
+// so the endpoint is the only thing left to tell them apart.
 func TestMarkAttemptCategoryLeavesAnUnrelatedEndpointAlone(t *testing.T) {
+	defer saveGlobals()()
+
 	gReport = diagnosticReport{}
 	gReport.Attempts = []helpers.Attempt{
 		attempt("bootstrap-cccp", "hostA:11210", helpers.PhaseConfig, ""),
-		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseResponse, ""),
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
 	}
 
 	markAttemptCategory("hostA:8091", helpers.CategoryConfigEmpty)
@@ -380,5 +384,42 @@ func TestMarkAttemptCategoryLeavesAnUnrelatedEndpointAlone(t *testing.T) {
 	}
 	if got := gReport.Attempts[1].Category; got != string(helpers.CategoryConfigEmpty) {
 		t.Errorf("named endpoint hostA:8091 was not amended: category = %q, want %q", got, helpers.CategoryConfigEmpty)
+	}
+}
+
+// markAttemptCategory identifies the record it may amend positively - the config phase
+// with no category, which is how and only how a successful fetch is sealed - rather than
+// by an empty category alone. Every failure today names a cause, so an empty category does
+// currently imply success; the first fixture below is what that assumption looks like when
+// it stops holding, and matching on it would move this cause onto a failed attempt while
+// leaving the successful fetch, the one actually being downgraded, untouched.
+func TestMarkAttemptCategoryOnlyAmendsASuccessfulFetch(t *testing.T) {
+	defer saveGlobals()()
+
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-cccp", "hostA:11210", helpers.PhaseSASL, ""),
+		attempt("bootstrap-http-terse", "hostA:11210", helpers.PhaseConfig, ""),
+	}
+
+	markAttemptCategory("hostA:11210", helpers.CategoryConfigEmpty)
+
+	if got := gReport.Attempts[0].Category; got != "" {
+		t.Errorf("a failed attempt was amended: category = %q, want empty", got)
+	}
+	if got := gReport.Attempts[1].Category; got != string(helpers.CategoryConfigEmpty) {
+		t.Errorf("the successful fetch was not amended: category = %q, want %q",
+			got, helpers.CategoryConfigEmpty)
+	}
+}
+
+// saveGlobals returns a function that puts the package's log and report globals back the
+// way they were.  Used as `defer saveGlobals()()`, it keeps a test that installs its own
+// globals from coupling every test that runs after it to this one's execution order.
+func saveGlobals() func() {
+	savedLog, savedReport := gLog, gReport
+
+	return func() {
+		gLog, gReport = savedLog, savedReport
 	}
 }

@@ -3,10 +3,13 @@ package helpers
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/couchbaselabs/sdk-doctor/memd"
 )
 
 // provokeRefused returns the real error the platform produces for a closed port
@@ -29,13 +32,18 @@ func provokeRefused(t *testing.T) error {
 	return err
 }
 
-// provokeNXDomain returns the real error for a name that cannot resolve
+// provokeNXDomain returns the real error for a name that cannot resolve.  RFC 6761
+//
+//	reserves .invalid precisely so this works, but a wildcard resolver or a captive
+//	portal answers for it anyway, and no test can control that - so an environment that
+//	resolves the name skips rather than fails.  dns_nxdomain's own reachability does not
+//	depend on this: TestClassifyDNSVariants proves it from a synthesized *net.DNSError.
 func provokeNXDomain(t *testing.T) error {
 	t.Helper()
 
 	_, err := net.LookupHost("this-host-does-not-resolve.invalid")
 	if err == nil {
-		t.Fatal("expected a resolution failure for a .invalid name")
+		t.Skip("this resolver answers for a .invalid name, so a lookup failure cannot be provoked here")
 	}
 
 	return err
@@ -124,6 +132,24 @@ func TestClassifyProvokedNetworkErrors(t *testing.T) {
 	}
 }
 
+// TestIsConnRefused pins the predicate every caller uses to tell "the peer said no" from
+// "the peer was never reached", which is the difference between a refused port and an
+// unreachable host in the report.  It lives here rather than in cmd, which now calls this
+// function directly instead of wrapping it.
+func TestIsConnRefused(t *testing.T) {
+	if refused := provokeRefused(t); !IsConnRefused(refused) {
+		t.Errorf("expected a refusal to be recognised, got %v", refused)
+	}
+
+	if nxdomain := provokeNXDomain(t); IsConnRefused(nxdomain) {
+		t.Errorf("expected a lookup failure to not be a refusal, got %v", nxdomain)
+	}
+
+	if IsConnRefused(errors.New("invalid bucket name/password")) {
+		t.Error("an auth rejection carries no errno, so it cannot be a refusal")
+	}
+}
+
 func TestClassifyDistinguishesHandshakeFromVerification(t *testing.T) {
 	// A TLS-phase failure that is not a certificate problem is a handshake problem
 	generic := &net.OpError{Op: "remote error", Err: errTestHandshake{}}
@@ -140,6 +166,64 @@ func TestClassifyDistinguishesHandshakeFromVerification(t *testing.T) {
 type errTestHandshake struct{}
 
 func (errTestHandshake) Error() string { return "handshake failure" }
+
+// TestClassifyTimeoutsAreNamedByPhase covers the one thing a timeout's error value cannot
+// tell you: whether the connection was ever established.  Only the phase knows, and a
+// record reading "phase: sasl, category: tcp_timeout" contradicts itself - the SASL
+// exchange cannot run on a connection whose TCP handshake never finished.
+func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
+	tests := []struct {
+		phase Phase
+		want  Category
+	}{
+		{PhaseNone, CategoryTCPTimeout},
+		{PhaseTCP, CategoryTCPTimeout},
+		{PhaseSASL, CategoryResponseTimeout},
+		{PhaseSelectBucket, CategoryResponseTimeout},
+		{PhaseResponse, CategoryResponseTimeout},
+		{PhaseConfig, CategoryResponseTimeout},
+	}
+
+	for _, test := range tests {
+		if got := Classify(test.phase, errTestTimeout{}); got != test.want {
+			t.Errorf("Classify(%q, timeout) = %q, want %q", test.phase, got, test.want)
+		}
+	}
+
+	// A TLS-phase stall is a handshake that never completed, which already has its own
+	//  category and must not be renamed by the timeout branch
+	if got := Classify(PhaseTLS, errTestTimeout{}); got != CategoryTLSHandshake {
+		t.Errorf("Classify(tls, timeout) = %q, want %q", got, CategoryTLSHandshake)
+	}
+}
+
+type errTestTimeout struct{}
+
+func (errTestTimeout) Error() string   { return "i/o timeout" }
+func (errTestTimeout) Timeout() bool   { return true }
+func (errTestTimeout) Temporary() bool { return true }
+
+// TestCategoryForConfigStatusKeepsMeaningfulStatuses guards the mapping GetConfig uses.
+// Reporting "CCCP is not supported" for a permission error would send the reader looking
+// for a server that predates the command, when the server implemented it and said no.
+func TestCategoryForConfigStatusKeepsMeaningfulStatuses(t *testing.T) {
+	tests := []struct {
+		status memd.StatusCode
+		want   Category
+	}{
+		{memd.StatusUnknownCommand, CategoryCCCPUnsupported},
+		{memd.StatusNotSupported, CategoryCCCPUnsupported},
+		{memd.StatusAccessError, CategoryBucketForbidden},
+		{memd.StatusAuthError, CategoryAuthRejected},
+		{memd.StatusKeyNotFound, CategoryBucketNotFound},
+	}
+
+	for _, test := range tests {
+		if got := CategoryForConfigStatus(test.status); got != test.want {
+			t.Errorf("CategoryForConfigStatus(%#x) = %q, want %q", test.status, got, test.want)
+		}
+	}
+}
 
 func TestClassifyDNSVariants(t *testing.T) {
 	tests := []struct {

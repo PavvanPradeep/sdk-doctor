@@ -38,6 +38,7 @@ const (
 	CategoryTCPUnreachable  Category = "tcp_unreachable"
 	CategoryTLSHandshake    Category = "tls_handshake"
 	CategoryTLSVerify       Category = "tls_verify"
+	CategoryResponseTimeout Category = "response_timeout"
 	CategoryAuthRejected    Category = "authentication_rejected"
 	CategoryBucketNotFound  Category = "bucket_not_found"
 	CategoryBucketForbidden Category = "bucket_forbidden"
@@ -53,7 +54,7 @@ func AllCategories() []Category {
 	return []Category{
 		CategoryDNSNXDomain, CategoryDNSTimeout, CategoryDNSFailed,
 		CategoryTCPRefused, CategoryTCPTimeout, CategoryTCPUnreachable,
-		CategoryTLSHandshake, CategoryTLSVerify,
+		CategoryTLSHandshake, CategoryTLSVerify, CategoryResponseTimeout,
 		CategoryAuthRejected, CategoryBucketNotFound, CategoryBucketForbidden,
 		CategoryCCCPUnsupported, CategoryConfigInvalid, CategoryConfigEmpty,
 		CategoryServerError, CategoryUnknown,
@@ -173,7 +174,15 @@ func Classify(phase Phase, err error) Category {
 
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return CategoryTCPTimeout
+		switch phase {
+		case PhaseSASL, PhaseSelectBucket, PhaseResponse, PhaseConfig:
+			// These phases only run on an established connection, so a stall here is the
+			//  peer going quiet after accepting - reporting it as a TCP timeout would
+			//  contradict the phase in the same record
+			return CategoryResponseTimeout
+		default:
+			return CategoryTCPTimeout
+		}
 	}
 
 	return CategoryUnknown
@@ -223,6 +232,20 @@ func CategoryForMemdStatus(status memd.StatusCode) Category {
 	default:
 		return CategoryUnknown
 	}
+}
+
+// CategoryForConfigStatus maps a failed CmdGetClusterConfig status to its cause.  A
+//
+//	server that does not implement the command is the common case and the one worth
+//	naming, but a permission or bucket error carries its own meaning and must not be
+//	reported as "CCCP is not supported" - so a status the general mapper recognises
+//	wins, and only an unrecognised one falls through to the unsupported diagnosis.
+func CategoryForConfigStatus(status memd.StatusCode) Category {
+	if category := CategoryForMemdStatus(status); category != CategoryUnknown {
+		return category
+	}
+
+	return CategoryCCCPUnsupported
 }
 
 // PhaseError is an error that knows which phase produced it and what it means
