@@ -10,9 +10,7 @@ import (
 	"github.com/couchbaselabs/sdk-doctor/memd"
 )
 
-// Phase names how far a connection attempt got.  Not every transport uses every
-//
-//	phase: CCCP has sasl and select-bucket, HTTP has response.
+// Phase names how far a connection attempt got; not every transport uses every phase
 type Phase string
 
 const (
@@ -94,27 +92,21 @@ func Dur(d time.Duration) string {
 	return d.Round(time.Microsecond).String()
 }
 
-// Windows reports refusals as WSAECONNREFUSED, which does not match syscall.ECONNREFUSED.
-//
-//	The Unix numbering is checked too, since syscall defines both sets on Windows.
+// Windows numbers these errors its own way, and syscall defines both sets there
 const (
 	wsaeConnRefused    = syscall.Errno(10061)
 	wsaeNetUnreachable = syscall.Errno(10051)
 	wsaeHostUnreach    = syscall.Errno(10065)
 )
 
-// IsConnRefused reports whether the peer answered with a refusal, which proves the
-//
-//	packets reached it and nothing was listening
+// IsConnRefused reports whether the peer refused, which proves the packets reached it
 func IsConnRefused(err error) bool {
 	var errno syscall.Errno
 
 	return errors.As(err, &errno) && (errno == syscall.ECONNREFUSED || errno == wsaeConnRefused)
 }
 
-// isUnreachable reports whether the network answered "no route", which is a different
-//
-//	finding from packets being dropped
+// isUnreachable reports whether the network answered "no route" rather than dropping packets
 func isUnreachable(err error) bool {
 	var errno syscall.Errno
 	if !errors.As(err, &errno) {
@@ -135,10 +127,7 @@ func isCertificateError(err error) bool {
 		errors.As(err, &wrongHostname)
 }
 
-// Classify names the cause of err, given the phase it occurred in.  The phase is
-//
-//	required rather than inferred: a rejected certificate and a broken handshake are
-//	indistinguishable from the error alone without matching on its text.
+// Classify names err's cause, using the phase to separate a rejected cert from a broken handshake
 func Classify(phase Phase, err error) Category {
 	if err == nil {
 		return ""
@@ -176,9 +165,7 @@ func Classify(phase Phase, err error) Category {
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		switch phase {
 		case PhaseSASL, PhaseSelectBucket, PhaseResponse, PhaseConfig:
-			// These phases only run on an established connection, so a stall here is the
-			//  peer going quiet after accepting - reporting it as a TCP timeout would
-			//  contradict the phase in the same record
+			// These phases only run on an established connection, so this is not a TCP timeout
 			return CategoryResponseTimeout
 		default:
 			return CategoryTCPTimeout
@@ -218,9 +205,7 @@ func phaseOfDial(dialErr *memd.DialError) Phase {
 	}
 }
 
-// CategoryForMemdStatus maps a memcached status to its category, exported so a
-//
-//	coverage test can prove each one is produced by real code
+// CategoryForMemdStatus maps a memcached status to its category
 func CategoryForMemdStatus(status memd.StatusCode) Category {
 	switch status {
 	case memd.StatusAuthError:
@@ -234,12 +219,7 @@ func CategoryForMemdStatus(status memd.StatusCode) Category {
 	}
 }
 
-// CategoryForConfigStatus maps a failed CmdGetClusterConfig status to its cause.  A
-//
-//	server that does not implement the command is the common case and the one worth
-//	naming, but a permission or bucket error carries its own meaning and must not be
-//	reported as "CCCP is not supported" - so a status the general mapper recognises
-//	wins, and only an unrecognised one falls through to the unsupported diagnosis.
+// CategoryForConfigStatus maps a failed config fetch, preferring a named cause over "unsupported"
 func CategoryForConfigStatus(status memd.StatusCode) Category {
 	if category := CategoryForMemdStatus(status); category != CategoryUnknown {
 		return category
@@ -255,7 +235,7 @@ type PhaseError struct {
 	Err      error
 }
 
-// NewPhaseError builds a PhaseError, tagging err with the phase and category it belongs to
+// NewPhaseError tags err with the phase and category it belongs to
 func NewPhaseError(phase Phase, category Category, err error) *PhaseError {
 	return &PhaseError{Phase: phase, Category: category, Err: err}
 }
@@ -305,17 +285,14 @@ func (b *AttemptBuilder) WithTiming(timing memd.ConnectTiming, sasl time.Duratio
 	return b
 }
 
-// withReached records the furthest phase a successful dial actually exercised - sasl or
-// select-bucket, depending on whether the bucket matched the authenticating user - so a
-// caller with no protocol step of its own beyond Dial can still seal the attempt correctly
+// withReached records the furthest phase a successful dial exercised, sasl or select-bucket
 func (b *AttemptBuilder) withReached(phase Phase) *AttemptBuilder {
 	b.reached = phase
 
 	return b
 }
 
-// Reached reports the furthest phase a successful dial actually exercised, recorded by
-// withReached. It is meaningless before Dial has returned successfully.
+// Reached reports the phase withReached recorded; meaningless before Dial has succeeded
 func (b *AttemptBuilder) Reached() Phase {
 	return b.reached
 }
@@ -362,10 +339,7 @@ func (b *AttemptBuilder) withAddresses(results []memd.AddressResult, phase Phase
 	return b
 }
 
-// FromDial classifies and seals a failed helpers.Dial call: err is always non-nil here
-// (Dial itself calls Finish directly on success, via the reached phase it tracked), so
-// there is no success case to handle. Exported because callers of Dial, not just Dial
-// itself, need to turn the error it returns into a sealed Attempt.
+// FromDial classifies and seals a failed Dial; err is always non-nil, as Dial seals its own success
 func (b *AttemptBuilder) FromDial(err error) Attempt {
 	var dialErr *memd.DialError
 	if errors.As(err, &dialErr) {

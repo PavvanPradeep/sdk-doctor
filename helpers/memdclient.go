@@ -21,14 +21,7 @@ type MemdClient struct {
 // dialBudget bounds connect and authentication together
 const dialBudget = 2000 * time.Millisecond
 
-// Dial will dial a particular host, tagging the attempt it records with kind, and return
-//
-//	a MemdClient along with the builder that has been accumulating that attempt's record
-//	throughout. The builder is always non-nil, whether the dial succeeded or failed, so
-//	the caller seals it themselves with builder.Finish once it knows the phase and
-//	category the outcome belongs to: on success that is builder.Reached() unless a later
-//	protocol step (a CCCP config fetch, say) decides the real final phase, and on failure
-//	it is whatever builder.FromDial(err) derives from err.
+// Dial returns the builder recording the attempt, non-nil either way, for the caller to seal
 func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (*MemdClient, *AttemptBuilder, error) {
 	if user == "" {
 		user = bucket

@@ -15,13 +15,7 @@ import (
 	"github.com/couchbaselabs/sdk-doctor/memd"
 )
 
-// TestEveryCategoryIsReachableFromRealCode proves the category taxonomy in
-// helpers.AllCategories contains nothing a real code path can't actually produce. Each
-// row below drives production code - a real HTTP server, a real refused port, a real
-// DNS lookup, the real memcached-status mapper, or Classify with an error shaped exactly
-// the way a live failure shapes it - rather than constructing the category constant it
-// expects. If a category is missing from the taxonomy's coverage, the test fails and
-// names it; a category nothing can reach is a classifier bug or should not exist.
+// Every row drives production code, so a category nothing can reach fails the test by name
 func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 	produced := map[helpers.Category]string{}
 
@@ -31,7 +25,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		}
 	}
 
-	// --- HTTP response statuses, through the real fetcher ---
+	// HTTP response statuses, through the real fetcher
 	record("http 401", fetchAgainst(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -51,10 +45,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		w.Write([]byte("this is not json"))
 	}))
 
-	// --- network failures, through the real CCCP fetcher. This is a different route from
-	//   cmd/diagnose_test.go's TestFetchHTTPTerseBucketConfigReportsARefusedPortAsTCP
-	//   (which drives the HTTP fetcher), so it is not a duplicate of that test - it proves
-	//   the CCCP path classifies a refusal the same way the HTTP path does. ---
+	// Network failures through the CCCP fetcher, proving it classifies a refusal as HTTP does
 	_, refused, _ := fetchCccpTerseBucketConfig("127.0.0.1", closedPort(t), "travel", "Administrator", "password", nil)
 	record("refused port", refused)
 	if refused.Phase != string(helpers.PhaseTCP) {
@@ -64,17 +55,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		t.Errorf("refused port: category = %q, want %q", refused.Category, helpers.CategoryTCPRefused)
 	}
 
-	// This is a real DNS lookup, so what comes back depends on how the environment's
-	//   resolver treats a name that can never resolve. Most resolvers answer NXDOMAIN
-	//   (dns_nxdomain), but a sandbox that blocks outbound DNS rather than answering it can
-	//   legitimately time out instead (dns_timeout), or fail some other way (dns_failed).
-	//   All three are real DNS-phase outcomes, so only the phase is pinned here; the
-	//   category is recorded whichever it turns out to be, and dns_nxdomain specifically is
-	//   also proven below through a synthetic Classify call that no resolver can change.
-	//   The assertion is conditional on the lookup actually failing, because a wildcard
-	//   resolver or captive portal answers even for a .invalid name: when it resolves, the
-	//   fetch goes on to dial the answer and legitimately reports a TCP-phase failure, and
-	//   failing the test for that would be failing it for the network's behaviour.
+	// A real lookup, so only the phase is pinned, and only when the name actually fails to resolve
 	const unresolvableHost = "this-host-does-not-resolve.invalid"
 
 	_, unresolvable, _ := fetchCccpTerseBucketConfig(unresolvableHost, 11210, "travel", "Administrator", "password", nil)
@@ -87,10 +68,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		t.Logf("skipping the DNS-phase assertion: this resolver answers for %q", unresolvableHost)
 	}
 
-	// --- a config that parses but does not describe its own node. This mirrors the real
-	//   decision in diagnose.go's scanTerseConfigList: GetSourceNodeExt returning nil is
-	//   what production code checks before calling markAttemptCategory, so this row checks
-	//   it too rather than asserting the category directly. ---
+	// A config that parses but describes no node of its own, checked as scanTerseConfigList does
 	defer saveGlobals()()
 
 	gLog = helpers.Logger{}
@@ -127,17 +105,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 	}
 	record("empty config", gReport.Attempts[0])
 
-	// --- phase-dependent classifications, through the real classifier. These errors are
-	//   synthesized rather than provoked from a live socket: Classify is itself the
-	//   production code under test here, and shaping the exact stdlib error type each
-	//   phase would hand it (a *net.DNSError, a net.Error with Timeout()==true, a
-	//   tls.RecordHeaderError, an x509.UnknownAuthorityError) is how its phase/error-type
-	//   dispatch gets exercised without a real DNS server, a black-holed route, or a
-	//   TLS peer that sends garbage instead of a handshake. "dns nxdomain" in particular
-	//   makes dns_nxdomain's reachability independent of the "unresolvable host" row above:
-	//   that row's real lookup can legitimately come back dns_timeout or dns_failed instead
-	//   in an environment that blocks outbound DNS rather than answering NXDOMAIN, so this
-	//   synthetic row guarantees dns_nxdomain is produced no matter how DNS behaves here. ---
+	// Phase-dependent classifications, with errors shaped the way the stdlib shapes them
 	for name, probe := range map[string]struct {
 		phase helpers.Phase
 		err   error
@@ -156,9 +124,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		}
 	}
 
-	// --- memcached protocol statuses, through the real mapper (helpers.CategoryForMemdStatus,
-	//   the function auth() and selectBucket() in helpers/memdclient.go actually call). The
-	//   statuses themselves are the real wire constants from the memd package. ---
+	// Memcached statuses, through the real mapper auth() and selectBucket() call
 	for name, status := range map[string]memd.StatusCode{
 		"sasl rejection":   memd.StatusAuthError,
 		"missing bucket":   memd.StatusKeyNotFound,
@@ -169,13 +135,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 		}
 	}
 
-	// --- cccp_unsupported comes from a config fetch the server answered with a status the
-	//   general mapper does not recognise, which is what a server that does not implement
-	//   CmdGetClusterConfig replies. helpers.CategoryForConfigStatus is the function
-	//   GetConfig itself calls, so driving it here proves the category through the same
-	//   code the live path uses - no fake memcached server needed, and no category
-	//   asserted by fiat. helpers/memdclient_test.go's TestDialReportsCCCPUnsupported
-	//   additionally proves it end to end over a real socket. ---
+	// cccp_unsupported through the mapper GetConfig calls, so no category is asserted by fiat
 	for name, status := range map[string]memd.StatusCode{
 		"cccp unsupported": memd.StatusUnknownCommand,
 	} {

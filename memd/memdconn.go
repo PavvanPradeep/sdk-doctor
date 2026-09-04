@@ -94,8 +94,7 @@ type AddressResult struct {
 	Err         error // raw; classification happens in helpers
 }
 
-// DialError carries what the dial had learned when it failed.  A failed dial still
-// returns a nil DialResult, as it always has, so no caller can be broken by this.
+// DialError carries what the dial had learned when it failed
 type DialError struct {
 	Timing    ConnectTiming
 	Addresses []AddressResult
@@ -171,8 +170,7 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		}
 	}
 
-	// Try every resolved address rather than only the first, as the standard dialer does,
-	//  and keep each outcome so a multi-homed host does not lose all but one error
+	// Every address is tried, and every outcome kept, so a multi-homed host loses no errors
 	var baseConn net.Conn
 
 	for i, ip := range ips {

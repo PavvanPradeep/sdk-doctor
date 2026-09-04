@@ -56,9 +56,7 @@ type tcpCountersResult struct {
 	Lost             uint32
 }
 
-// reportSchemaVersion is bumped whenever a field's meaning changes, so a consumer can
-//
-//	tell which shape it is reading rather than inferring it
+// reportSchemaVersion is bumped whenever a field's meaning changes, so a consumer can tell
 const reportSchemaVersion = 1
 
 type diagnosticReport struct {

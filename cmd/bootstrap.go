@@ -7,32 +7,20 @@ import (
 	"github.com/couchbaselabs/sdk-doctor/helpers"
 )
 
-// legacyUnreachableMessage is the sentence sdk-doctor has always printed when nothing
-//
-//	answered.  It is preserved verbatim: support tooling greps for it, and for the case
-//	it describes it is accurate.
+// legacyUnreachableMessage is preserved verbatim: support tooling greps for it
 const legacyUnreachableMessage = "All endpoints specified by your connection string were unreachable," +
 	" further cluster diagnostics are not possible"
 
-// recordAttempt files an attempt in the report
 func recordAttempt(attempt helpers.Attempt) {
 	gReport.Attempts = append(gReport.Attempts, attempt)
 }
 
-// markAttemptCategory downgrades an already-recorded attempt whose configuration turned
-//
-//	out to be unusable, which is only discovered after the fetch returned successfully.
-//	endpoint is matched exactly (not by host prefix) and only a successful config fetch
-//	is amended, so a host that appears more than once in the report — the same hostname
-//	bootstrapped over both CCCP and HTTP, say — cannot have an unrelated attempt's
-//	outcome overwritten by this one's.  Success is identified positively, by the config
-//	phase with no category, rather than by an empty category alone: that keeps the match
-//	pinned to the one record this can honestly downgrade even if some future path ever
-//	seals a failure without naming a cause.
+// markAttemptCategory downgrades a config that was fetched successfully but turned out unusable
 func markAttemptCategory(endpoint string, category helpers.Category) {
 	for i := range gReport.Attempts {
 		attempt := &gReport.Attempts[i]
 
+		// A successful fetch is the only record this can honestly amend, so match it positively
 		reachedConfig := attempt.Phase == string(helpers.PhaseConfig) && attempt.Category == ""
 		if !reachedConfig || attempt.Endpoint != endpoint {
 			continue
@@ -52,9 +40,7 @@ var phasesPastTCP = map[string]bool{
 	string(helpers.PhaseConfig):       true,
 }
 
-// reachedPastTCP reports whether any attempt got beyond the TCP handshake, which is
-//
-//	what decides whether "unreachable" is an honest description of the failure
+// reachedPastTCP decides whether "unreachable" is an honest description of the failure
 func reachedPastTCP(attempts []helpers.Attempt) bool {
 	for _, attempt := range attempts {
 		if phasesPastTCP[attempt.Phase] {
@@ -65,10 +51,7 @@ func reachedPastTCP(attempts []helpers.Attempt) bool {
 	return false
 }
 
-// categoryRank orders causes by how much they tell the reader, most informative first.
-//
-//	The most informative cause is the actionable one: if one endpoint rejected the
-//	credentials and another was refused, wrong credentials is why bootstrap failed.
+// categoryRank orders causes by how actionable they are, since that is what the reader needs
 var categoryRank = []helpers.Category{
 	helpers.CategoryAuthRejected,
 	helpers.CategoryBucketForbidden,
@@ -99,9 +82,7 @@ func rankedCategory(attempts []helpers.Attempt) helpers.Category {
 	return ""
 }
 
-// otherCategories lists the categories present besides the selected one, in the order
-//
-//	they were observed, so a mixed run hides nothing
+// otherCategories lists the categories present besides the selected one, so a mixed run hides nothing
 func otherCategories(attempts []helpers.Attempt, selected helpers.Category) []helpers.Category {
 	var others []helpers.Category
 	seen := map[helpers.Category]bool{selected: true, "": true}
@@ -141,9 +122,7 @@ func firstError(attempts []helpers.Attempt, category helpers.Category) string {
 	return ""
 }
 
-// bootstrapSummary builds the line printed when no endpoint yielded a configuration.
-//
-//	Phase decides whether the legacy sentence applies; category decides what replaces it.
+// bootstrapSummary builds the line printed when no endpoint yielded a configuration
 func bootstrapSummary(attempts []helpers.Attempt, bucket string) string {
 	if !reachedPastTCP(attempts) {
 		return legacyUnreachableMessage
@@ -186,14 +165,7 @@ func bootstrapSummary(attempts []helpers.Attempt, bucket string) string {
 		summary = fmt.Sprintf(
 			"%d of %d endpoints responded but returned a configuration the doctor could not use.", hit, total)
 	case "":
-		// Rule 1 already established that something answered above the network layer, so
-		//  the legacy "unreachable" sentence would be false here. Nothing ranked is
-		//  present, so the categories actually observed are the whole story - naming them
-		//  inline (rather than falling through to the "further endpoint(s)" loop below)
-		//  keeps every attempt counted exactly once. Without this, categoryRank's "" match
-		//  makes countWithCategory(attempts, "") come back 0, so the primary sentence's
-		//  implied set would be empty while every real category showed up as "further" -
-		//  double-counting the very attempts the primary sentence was supposed to cover.
+		// Named inline rather than by the loop below, which would double-count them
 		summary = fmt.Sprintf("%d endpoint(s) answered but none returned a usable configuration.", total)
 
 		if present := otherCategories(attempts, selected); len(present) > 0 {
@@ -222,9 +194,7 @@ func bootstrapSummary(attempts []helpers.Attempt, bucket string) string {
 	return summary
 }
 
-// renderAttemptTable lays the attempts out one per row, for the failure path where the
-//
-//	reader needs the detail without opening the JSON report
+// renderAttemptTable lays the attempts out one per row, for a reader without the JSON report
 func renderAttemptTable(attempts []helpers.Attempt) string {
 	endpointWidth := len("ENDPOINT")
 	phaseWidth := len("PHASE")

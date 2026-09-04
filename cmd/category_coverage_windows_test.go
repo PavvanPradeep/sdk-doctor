@@ -2,10 +2,7 @@ package cmd
 
 import "syscall"
 
-// syscallEHostUnreach returns the errno the category-coverage test synthesizes to prove
-// tcp_unreachable is reachable through Classify. WSAEHOSTUNREACH does not match
-// syscall.EHOSTUNREACH's Unix numbering, so this is a separate value from the
-// notwindows build, the same way helpers/hostinfo_windows.go diverges from its sibling.
+// WSAEHOSTUNREACH does not match syscall.EHOSTUNREACH, so this diverges from the Unix build
 func syscallEHostUnreach() syscall.Errno {
 	return syscall.Errno(10065)
 }

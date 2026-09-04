@@ -53,10 +53,7 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 		t.Fatalf("unexpected report header: %+v", got)
 	}
 
-	// Asserted against the literal, not the reportSchemaVersion constant: comparing against
-	//  the same symbol the code under test reads would make this pass no matter what the
-	//  constant was changed to, pinning nothing. The whole point of a schema version is to
-	//  be a stable published number, so this must fail if it silently changes.
+	// The literal, not the constant: comparing against the same symbol would pin nothing
 	if got.SchemaVersion != 1 {
 		t.Fatalf("expected schema version 1, got %d", got.SchemaVersion)
 	}
@@ -114,11 +111,7 @@ func TestLogConnectPhasesWithoutDNSOrTLS(t *testing.T) {
 	}
 }
 
-// TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP pins the corrected behaviour:
-// an attempt that never reached TCP (Attempt.TCP is empty) must still be recorded in the
-// report, since recording and logging are separate responsibilities and a reused
-// keep-alive HTTP connection produces exactly this shape. Only the phases log line is
-// skipped, since there is nothing to format without a TCP timing.
+// A reused keep-alive connection has no TCP timing, but must still reach the report
 func TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP(t *testing.T) {
 	defer saveGlobals()()
 
@@ -138,15 +131,7 @@ func TestLogConnectPhasesRecordsButDoesNotLogAttemptsWithoutTCP(t *testing.T) {
 	}
 }
 
-// TestLogConnectPhasesPreservesTheAttemptKindVerbatim pins that logConnectPhases (and the
-//
-//	report pipeline behind it) never rewrites Kind: whatever string the caller built the
-//	attempt with — including the port-label form service probes use, e.g. "service-mgmt" —
-//	comes out the other end unchanged. This does not, and cannot without integration
-//	scaffolding, catch a caller building the wrong Kind in the first place (the
-//	svcName-vs-svcKeyPlain mistake this task avoided lives inside the unexported
-//	testMemdService/testHTTPService closures in diagnose.go, which have no seam reachable
-//	from a unit test); it only pins that the pipeline is not where such a bug could hide.
+// The pipeline never rewrites Kind; a caller building the wrong one is out of reach here
 func TestLogConnectPhasesPreservesTheAttemptKindVerbatim(t *testing.T) {
 	defer saveGlobals()()
 

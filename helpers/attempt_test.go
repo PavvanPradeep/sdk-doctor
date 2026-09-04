@@ -32,12 +32,7 @@ func provokeRefused(t *testing.T) error {
 	return err
 }
 
-// provokeNXDomain returns the real error for a name that cannot resolve.  RFC 6761
-//
-//	reserves .invalid precisely so this works, but a wildcard resolver or a captive
-//	portal answers for it anyway, and no test can control that - so an environment that
-//	resolves the name skips rather than fails.  dns_nxdomain's own reachability does not
-//	depend on this: TestClassifyDNSVariants proves it from a synthesized *net.DNSError.
+// provokeNXDomain returns the real error for a name that cannot resolve, skipping if it does
 func provokeNXDomain(t *testing.T) error {
 	t.Helper()
 
@@ -91,9 +86,7 @@ func provokeTLSVerify(t *testing.T) error {
 		}
 		defer conn.Close()
 
-		// Accept does not itself perform the handshake (it is deferred to the first
-		//  Read/Write), so drive it explicitly: only then does the server actually send
-		//  its certificate for the client to reject.
+		// Accept defers the handshake to the first Read/Write, so drive it explicitly here
 		if tlsConn, ok := conn.(*tls.Conn); ok {
 			tlsConn.Handshake()
 		}
@@ -132,10 +125,7 @@ func TestClassifyProvokedNetworkErrors(t *testing.T) {
 	}
 }
 
-// TestIsConnRefused pins the predicate every caller uses to tell "the peer said no" from
-// "the peer was never reached", which is the difference between a refused port and an
-// unreachable host in the report.  It lives here rather than in cmd, which now calls this
-// function directly instead of wrapping it.
+// Telling "the peer said no" from "the peer was never reached" separates refused from unreachable
 func TestIsConnRefused(t *testing.T) {
 	if refused := provokeRefused(t); !IsConnRefused(refused) {
 		t.Errorf("expected a refusal to be recognised, got %v", refused)
@@ -167,10 +157,7 @@ type errTestHandshake struct{}
 
 func (errTestHandshake) Error() string { return "handshake failure" }
 
-// TestClassifyTimeoutsAreNamedByPhase covers the one thing a timeout's error value cannot
-// tell you: whether the connection was ever established.  Only the phase knows, and a
-// record reading "phase: sasl, category: tcp_timeout" contradicts itself - the SASL
-// exchange cannot run on a connection whose TCP handshake never finished.
+// Only the phase knows whether the connection was established, so "sasl / tcp_timeout" is a contradiction
 func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 	tests := []struct {
 		phase Phase
@@ -190,8 +177,7 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 		}
 	}
 
-	// A TLS-phase stall is a handshake that never completed, which already has its own
-	//  category and must not be renamed by the timeout branch
+	// A TLS-phase stall already has its own category and must not be renamed
 	if got := Classify(PhaseTLS, errTestTimeout{}); got != CategoryTLSHandshake {
 		t.Errorf("Classify(tls, timeout) = %q, want %q", got, CategoryTLSHandshake)
 	}
@@ -203,9 +189,7 @@ func (errTestTimeout) Error() string   { return "i/o timeout" }
 func (errTestTimeout) Timeout() bool   { return true }
 func (errTestTimeout) Temporary() bool { return true }
 
-// TestCategoryForConfigStatusKeepsMeaningfulStatuses guards the mapping GetConfig uses.
-// Reporting "CCCP is not supported" for a permission error would send the reader looking
-// for a server that predates the command, when the server implemented it and said no.
+// "CCCP is not supported" for a permission error sends the reader hunting an old server
 func TestCategoryForConfigStatusKeepsMeaningfulStatuses(t *testing.T) {
 	tests := []struct {
 		status memd.StatusCode
@@ -269,8 +253,7 @@ func TestClassifyReturnsNoCategoryForSuccess(t *testing.T) {
 	}
 }
 
-// A PhaseError with a nil Err is unreachable through NewPhaseError today, but the type is
-// exported public surface, so a caller built some other way must not make Error() panic.
+// A nil Err is unreachable through NewPhaseError, but PhaseError is exported: Error() must not panic
 func TestPhaseErrorDoesNotPanicOnNilErr(t *testing.T) {
 	e := &PhaseError{Phase: PhaseTLS, Category: CategoryTLSVerify}
 

@@ -10,9 +10,7 @@ import (
 	"github.com/couchbaselabs/sdk-doctor/memd"
 )
 
-// fakeServer answers memcached packets with statuses the test dictates, so auth and
-//
-//	bucket failures can be provoked without a cluster
+// fakeServer answers with statuses the test dictates, so failures need no cluster
 type fakeServer struct {
 	ln       net.Listener
 	statuses map[memd.CommandCode]memd.StatusCode
@@ -44,13 +42,7 @@ func (s *fakeServer) serve() {
 	memdConn := memd.NewConn(conn)
 
 	for {
-		// memd.ReadWriteCloser is written for the client side of the protocol only
-		// (ReadPacket wants a *Response, WritePacket wants a *Request). The request and
-		// response headers share the exact same wire layout though (byte 6:8 is "vbucket"
-		// on the way in and "status" on the way out), so the server side reads the
-		// incoming header into a Response (only .Opcode is needed) and writes its answer
-		// as a Request, stashing the status code in the Vbucket field so it lands in the
-		// same header bytes a real response would use.
+		// The two headers share a wire layout, so answer as a Request with the status in Vbucket
 		var req memd.Response
 		if err := memdConn.ReadPacket(&req); err != nil {
 			return
@@ -73,9 +65,7 @@ func (s *fakeServer) serve() {
 	}
 }
 
-// startFakeTLSServer is startFakeServer over a TLS listener, using the same self-signed
-// cert attempt_testcert_test.go builds for the TLS-classification tests, so a dial with
-// InsecureSkipVerify can complete a real handshake against it.
+// startFakeTLSServer is startFakeServer over TLS, so a dial can complete a real handshake
 func startFakeTLSServer(t *testing.T, statuses map[memd.CommandCode]memd.StatusCode) (host string, port int, closeFn func()) {
 	t.Helper()
 
@@ -97,10 +87,7 @@ func startFakeTLSServer(t *testing.T, statuses map[memd.CommandCode]memd.StatusC
 	return "127.0.0.1", addr.Port, func() { ln.Close() }
 }
 
-// startDroppingServer accepts one connection, reads exactly one request, then closes
-// without answering - so the client's next read fails with a transport error (EOF),
-// not a protocol status. This exercises the phase a bare read/write failure occurs in,
-// as opposed to the phase a non-zero status is reported for.
+// startDroppingServer closes without answering, so the client sees a transport error, not a status
 func startDroppingServer(t *testing.T) (host string, port int, closeFn func()) {
 	t.Helper()
 
@@ -165,8 +152,7 @@ func TestDialRecordsTLSPhaseForATLSConnectedAddress(t *testing.T) {
 	if len(attempt.Addresses) == 0 {
 		t.Fatalf("expected at least one recorded address, got %+v", attempt)
 	}
-	// The address connected over TLS, so it reached further than plain TCP - recording
-	// it as "tcp" would silently downgrade what actually happened.
+	// The address connected over TLS, so recording it as "tcp" would downgrade what happened
 	if attempt.Addresses[0].Phase != string(PhaseTLS) {
 		t.Errorf("expected the connected address to record the tls phase, got %q", attempt.Addresses[0].Phase)
 	}
@@ -239,9 +225,7 @@ func TestDialReportsCCCPUnsupported(t *testing.T) {
 	})
 	defer closeFn()
 
-	// bucket ("travel") != user ("Administrator"), so selectBucket runs and the
-	// successful attempt should report having reached PhaseSelectBucket, the furthest
-	// rung this dial actually exercised.
+	// bucket != user, so selectBucket runs and select-bucket is the furthest rung reached
 	client, builder, err := Dial("bootstrap-cccp", host, port, "travel", "Administrator", "password", nil)
 	if err != nil {
 		t.Fatalf("the dial itself should succeed: %s", err)
@@ -275,8 +259,7 @@ func TestDialReportsSASLPhaseWhenSelectBucketIsSkipped(t *testing.T) {
 	host, port, closeFn := startFakeServer(t, nil)
 	defer closeFn()
 
-	// bucket == user means Dial never calls selectBucket, so the successful attempt
-	// must not claim a phase further than sasl - that would report a rung that never ran.
+	// bucket == user skips selectBucket, so claiming a phase past sasl reports a rung that never ran
 	client, builder, err := Dial("service-kv", host, port, "Administrator", "Administrator", "password", nil)
 	if err != nil {
 		t.Fatalf("the dial itself should succeed: %s", err)
@@ -289,10 +272,7 @@ func TestDialReportsSASLPhaseWhenSelectBucketIsSkipped(t *testing.T) {
 	}
 }
 
-// TestDialTagsTheAttemptWithItsKindParameter pins the mechanism A3 depends on: Dial's
-// first argument must reach the sealed Attempt's Kind field unchanged. Without this, the
-// connectivity probe ("service-kv") and the performance dial ("perf-kv") would collapse
-// back into one indistinguishable value in the report, exactly the collision A3 fixed.
+// Dial's kind must reach Attempt.Kind unchanged, or "service-kv" and "perf-kv" collapse into one
 func TestDialTagsTheAttemptWithItsKindParameter(t *testing.T) {
 	host, port, closeFn := startFakeServer(t, nil)
 	defer closeFn()
@@ -310,9 +290,7 @@ func TestDialTagsTheAttemptWithItsKindParameter(t *testing.T) {
 	}
 }
 
-// TestDialFailureProducesARecordableAttempt pins the other half of A3: a failed dial must
-// still yield an Attempt with something meaningful to record (a non-empty Phase and
-// Category), not a zero value that a caller's recordAttempt call would silently drop.
+// A failed dial must still yield a Phase and Category, not a zero value worth nothing to record
 func TestDialFailureProducesARecordableAttempt(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

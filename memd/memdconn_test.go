@@ -34,8 +34,7 @@ func startEchoListener(t *testing.T) (addr string, closeFn func()) {
 	return ln.Addr().String(), func() { ln.Close() }
 }
 
-// A DialError with a nil Err is unreachable through DialMemdConn today, but the type is
-// exported public surface, so a caller built some other way must not make Error() panic.
+// A nil Err is unreachable through DialMemdConn, but DialError is exported: Error() must not panic
 func TestDialErrorDoesNotPanicOnNilErr(t *testing.T) {
 	e := &DialError{}
 
@@ -99,10 +98,7 @@ func TestReadDeadlineBoundsAStalledPeer(t *testing.T) {
 	}
 }
 
-// unresolvableHost is reserved by RFC 6761 so that it can never resolve.  A wildcard
-// resolver or a captive portal answers for it regardless, and a test cannot control the
-// environment's resolver - so the tests below skip rather than fail when the name resolves,
-// since resolution succeeding means the failure they are about never happened.
+// A wildcard resolver answers even this RFC 6761 name, so the tests below skip when it resolves
 const unresolvableHost = "this-host-does-not-resolve.invalid"
 
 func requireUnresolvable(t *testing.T) {

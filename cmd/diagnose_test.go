@@ -465,8 +465,7 @@ func TestNetworkFromTerseBucketConfigIsDeterministic(t *testing.T) {
 		}},
 	}
 
-	// Map iteration order is randomized per range, so a run without sorted keys would be
-	// unlikely to return the same network every time across enough repetitions
+	// Map order is randomized per range, so unsorted keys would not survive this many runs
 	for i := 0; i < 20; i++ {
 		if got := networkFromTerseBucketConfig(config); got != "external" {
 			t.Fatalf("run %d: expected the alphabetically-first match `external`, got `%s`", i, got)
@@ -474,9 +473,7 @@ func TestNetworkFromTerseBucketConfigIsDeterministic(t *testing.T) {
 	}
 }
 
-// A refused TCP connection must be reported at the TCP phase, not the DNS phase: the
-// httptrace hook that would otherwise prove a successful connect never fires on a
-// refusal, so the phase has to be inferred from the error itself, not from timing alone.
+// A refusal never fires the connect hook, so the phase comes from the error, not the timing
 func TestFetchHTTPTerseBucketConfigReportsARefusedPortAsTCP(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -503,9 +500,7 @@ func TestFetchHTTPTerseBucketConfigReportsARefusedPortAsTCP(t *testing.T) {
 	}
 }
 
-// A rejected server certificate must be reported at the TLS phase, not the TCP phase:
-// httptrace stamps TLSHandshakeDone even when the handshake fails, so a naive "TLS
-// finished cleanly" check can't tell a completed handshake from a rejected one.
+// TLSHandshakeDone is stamped even on failure, so "TLS finished" cannot mean "TLS succeeded"
 func TestFetchHTTPTerseBucketConfigReportsARejectedCertAsTLS(t *testing.T) {
 	srv := httptest.NewTLSServer(nil)
 	defer srv.Close()
@@ -519,8 +514,7 @@ func TestFetchHTTPTerseBucketConfigReportsARejectedCertAsTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A non-nil but otherwise default config: default certificate verification applies,
-	// and the server's self-signed cert is not in any trust store this test controls.
+	// A default config verifies certificates, and this server's is in no trust store
 	tlsConfig := &tls.Config{}
 
 	_, gotAttempt, err := fetchHTTPTerseBucketConfig(host, port, "default", "u", "p", tlsConfig)
@@ -536,12 +530,7 @@ func TestFetchHTTPTerseBucketConfigReportsARejectedCertAsTLS(t *testing.T) {
 	}
 }
 
-// A server that completes the TCP handshake and then never answers (a hung mgmt port, a
-// stalling proxy, an overloaded node) must be reported at the response phase, not the TCP
-// phase: timing.TCPDone is stamped only when a connect succeeds, so it is the "we reached
-// the server" signal even though the request itself never got an answer. Misclassifying
-// this at PhaseTCP would make reachedPastTCP false and emit the legacy "unreachable"
-// sentence for an endpoint that was demonstrably reached.
+// TCPDone is stamped only on a successful connect, so a hung server was still reached
 func TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -549,8 +538,7 @@ func TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Accept every connection and never write a response. The goroutine exits on its own
-	// once the client (after its own timeout) drops the connection.
+	// Accept and never answer; the goroutine exits when the client drops the connection
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -587,12 +575,7 @@ func TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse(t *testing.T) {
 	}
 }
 
-// httpFailurePhase is where both HTTP paths - the bootstrap config fetch and the service
-// probe - decide what a failed request means, so its four branches are pinned here rather
-// than only through whichever caller happens to exercise one. The TLS branch is the reason
-// this function takes the handshake's outcome as an argument: httptrace fires
-// TLSHandshakeDone on failure too, so a timing struct alone cannot tell a rejected
-// certificate from a handshake that succeeded before the request stalled.
+// Both HTTP paths decide here, so every branch is pinned rather than only the ones a caller hits
 func TestHTTPFailurePhase(t *testing.T) {
 	now := time.Now()
 
@@ -621,17 +604,12 @@ func TestHTTPFailurePhase(t *testing.T) {
 	}
 }
 
-// The TLS counterpart of TestFetchHTTPTerseBucketConfigReportsAHungServerAsResponse: a
-// server that completes the handshake and then never answers must be reported at the
-// response phase. Inferring the phase from TLSStart alone reported this as a failed TLS
-// handshake - naming trust configuration as the cause for a node whose certificate the
-// client had already accepted, and sending the reader to the wrong problem entirely.
+// Inferring from TLSStart alone blamed trust configuration for a cert the client had accepted
 func TestFetchHTTPTerseBucketConfigReportsAHungTLSServerAsResponse(t *testing.T) {
 	release := make(chan struct{})
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		// Outlive the fetcher's own budget, so the request times out with the handshake
-		//  already behind it
+		// Outlive the fetcher's budget, so it times out with the handshake already behind it
 		<-release
 	}))
 	defer srv.Close()
@@ -646,8 +624,7 @@ func TestFetchHTTPTerseBucketConfigReportsAHungTLSServerAsResponse(t *testing.T)
 		t.Fatalf("failed to read the test server port: %s", err)
 	}
 
-	// The handshake must succeed for this test to be about anything, so the server's own
-	//  certificate is accepted rather than verified
+	// The handshake must succeed here, so the server's certificate is accepted, not verified
 	_, gotAttempt, err := fetchHTTPTerseBucketConfig(parsed.Hostname(), port, "default", "u", "p",
 		&tls.Config{InsecureSkipVerify: true})
 	if err == nil {
@@ -669,18 +646,13 @@ func TestFetchHTTPTerseBucketConfigReportsAHungTLSServerAsResponse(t *testing.T)
 		}
 	}
 
-	// Naming the cause, not merely avoiding the wrong ones: a category the summary does
-	//  not rank falls back to a generic "none returned a usable configuration" line, which
-	//  passes the checks above while telling the reader nothing about the stall
+	// An unranked category falls back to a generic line that would pass the checks above
 	if !strings.Contains(summary, "stopped responding") {
 		t.Errorf("expected the summary to name the stall, got: %s", summary)
 	}
 }
 
-// A configuration that does not describe its own node cannot be used: the doctor has no
-// way to tell which of the nodes it lists is the one that answered, which is what network
-// selection and every node-local check are keyed on. Selecting it as the master config and
-// only then rejecting it printed "it cannot be used" and went on to use it anyway.
+// Selecting the config and only then rejecting it printed "cannot be used" and used it anyway
 func TestScanTerseConfigListRejectsAConfigThatDescribesNoNodeOfItsOwn(t *testing.T) {
 	defer saveGlobals()()
 
@@ -734,9 +706,7 @@ func TestScanTerseConfigListFallsThroughToTheNextUsableConfig(t *testing.T) {
 	}
 }
 
-// clusterNodesFromTerseBucketConfig returns nil when a node carries no entry for the
-// selected alternate network. Every bootstrap attempt succeeded in that case, so without
-// a report here the run failed bootstrap while naming no cause at all.
+// Every attempt succeeds in this case, so without a report the run names no cause at all
 func TestNodesFromMasterConfigReportsAMissingAlternateNetwork(t *testing.T) {
 	defer saveGlobals()()
 

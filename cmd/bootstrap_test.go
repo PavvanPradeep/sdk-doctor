@@ -112,10 +112,7 @@ func TestBootstrapSummaryNamesTheCauseWhenSomethingAnswered(t *testing.T) {
 }
 
 func TestBootstrapSummaryScopesTheReachableClauseToItsOwnEndpoints(t *testing.T) {
-	// Fix 1: the "reachable" clause must be scoped to the endpoints the category
-	//  actually describes ("those endpoints"), not phrased as a blanket claim about
-	//  every endpoint in the run ("the endpoints themselves" / "the endpoints"), which
-	//  would contradict a "N of M" count that is less than the total.
+	// The "reachable" clause covers only the endpoints counted, or it contradicts an N-of-M count
 	tests := []struct {
 		name     string
 		attempts []helpers.Attempt
@@ -184,14 +181,7 @@ func TestBootstrapSummaryRanksAuthAboveAnUnreachableNode(t *testing.T) {
 	}
 }
 
-// TestBootstrapSummaryCountsAnUnrankedCategoryOnceOnly pins the fix for the bug the A1
-// phase change exposed: tcp_timeout (and every other pre-TCP-phase category) is not in
-// categoryRank, so a single response-phase attempt whose category is tcp_timeout used to
-// make rankedCategory return "", which made the primary sentence's implied set empty
-// while the "further endpoint(s)" loop then named tcp_timeout on top of it - the one
-// attempt was counted as both "answered" and "further", which is incoherent for a run of
-// exactly one. The fix names the observed categories inline and returns early, so nothing
-// is double-counted.
+// An unranked category once counted the same attempt as both "answered" and "further"
 func TestBootstrapSummaryCountsAnUnrankedCategoryOnceOnly(t *testing.T) {
 	attempts := []helpers.Attempt{
 		attempt("bootstrap-http-terse", "node1:8091", helpers.PhaseResponse, helpers.CategoryTCPTimeout),
@@ -210,10 +200,7 @@ func TestBootstrapSummaryCountsAnUnrankedCategoryOnceOnly(t *testing.T) {
 	}
 }
 
-// TestBootstrapSummaryRankedPathStillAppendsFurther is the companion to the test above:
-// once a category IS ranked (selected != ""), the "further endpoint(s)" loop is still the
-// wanted behaviour for naming every other category present, and must not have been
-// disturbed by scoping the fix to the selected == "" case only.
+// Once a category is ranked, the "further endpoint(s)" loop is still wanted
 func TestBootstrapSummaryRankedPathStillAppendsFurther(t *testing.T) {
 	attempts := []helpers.Attempt{
 		attempt("bootstrap-cccp", "node1:11210", helpers.PhaseTCP, helpers.CategoryTCPTimeout),
@@ -231,9 +218,7 @@ func TestBootstrapSummaryRankedPathStillAppendsFurther(t *testing.T) {
 }
 
 func TestBootstrapSummaryFallsBackToTheRawError(t *testing.T) {
-	// This attempt got past TCP (PhaseConfig), so rule 1 does not apply and the legacy
-	//  "unreachable" sentence would be false here — the default branch must say something
-	//  else while still carrying the raw error through.
+	// Past TCP, so the legacy sentence would be false and the raw error must come through instead
 	odd := attempt("bootstrap-cccp", "node1:11210", helpers.PhaseConfig, helpers.CategoryUnknown)
 	odd.Error = "something nobody predicted"
 
@@ -248,12 +233,7 @@ func TestBootstrapSummaryFallsBackToTheRawError(t *testing.T) {
 }
 
 func TestBootstrapSummaryKeepsTheLegacyLineOnlyWhenNothingGotPastTCP(t *testing.T) {
-	// Fix 4: rule 1 (reachedPastTCP) must be the only path that emits the legacy
-	//  sentence. This input carries a Phase of PhaseTCP (so reachedPastTCP is false) and
-	//  a Category of CategoryUnknown with a non-empty Error, which is exactly the
-	//  shape that also flows through the switch's default branch when reachedPastTCP is
-	//  (incorrectly) true. If rule 1 is bypassed, the default branch produces a
-	//  different, non-legacy message, so this test distinguishes the two paths.
+	// This shape also flows through the default branch, so it separates rule 1 from that path
 	odd := attempt("bootstrap-cccp", "node1:11210", helpers.PhaseTCP, helpers.CategoryUnknown)
 	odd.Error = "something nobody predicted"
 
@@ -265,10 +245,7 @@ func TestBootstrapSummaryKeepsTheLegacyLineOnlyWhenNothingGotPastTCP(t *testing.
 }
 
 func TestRenderAttemptTableAlignsAndCoversEveryAttempt(t *testing.T) {
-	// Endpoints (and phases, and elapsed times) of clearly different lengths, and
-	//  deliberately not matching the header words' own lengths, so that a column which
-	//  lost its fixed-width padding would visibly misalign rather than align by
-	//  coincidence.
+	// Widths differ from each other and from the headers, so lost padding cannot align by luck
 	attempts := []helpers.Attempt{
 		attempt("bootstrap-cccp", "e1:1", helpers.PhaseSASL, helpers.CategoryAuthRejected),
 		attempt("bootstrap-http-terse", "node1.sdkdoctor.test.example.com:8091", helpers.PhaseResponse, helpers.CategoryAuthRejected),
@@ -293,21 +270,14 @@ func TestRenderAttemptTableAlignsAndCoversEveryAttempt(t *testing.T) {
 		t.Errorf("expected 3 lines for 2 attempts, got %d:\n%s", lines+1, got)
 	}
 
-	// Trim only the trailing newline here (unlike the count check above) so each
-	//  line keeps its leading padding intact - trimming the whole string would strip
-	//  the header's leading spaces but not the rows', skewing every offset below.
+	// Only the trailing newline is trimmed, or the header loses leading spaces the rows keep
 	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("expected 3 lines, got %d:\n%s", len(lines), got)
 	}
 	header, row1, row2 := lines[0], lines[1], lines[2]
 
-	// Real alignment check: the byte offset of each left-justified/unpadded column's
-	//  first character must be identical across the header and every row. ENDPOINT and
-	//  PHASE are left-justified (%-Ns) and RESULT is the trailing unpadded column
-	//  (%s); each one's start offset depends on every column before it being padded to
-	//  its declared fixed width, so swapping any of those specs for a bare %s would
-	//  shift these offsets apart for rows of different lengths.
+	// Each column's start offset must match across header and rows, so all padding must hold
 	columns := map[string][]int{
 		"ENDPOINT": {
 			strings.Index(header, "ENDPOINT"),
@@ -362,12 +332,7 @@ func TestReachedPastTCP(t *testing.T) {
 	}
 }
 
-// markAttemptCategory must amend only the endpoint it names. A host bootstrapped over
-// both CCCP and HTTP produces two attempts sharing a hostname on different ports; a
-// match keyed on the endpoint's host alone would stamp both, mislabeling whichever one
-// actually succeeded. Both fixtures are sealed the way a successful fetch really is -
-// the config phase with no category, which is what both transports record on success -
-// so the endpoint is the only thing left to tell them apart.
+// Both fixtures are sealed the way a real success is, so only the endpoint tells them apart
 func TestMarkAttemptCategoryLeavesAnUnrelatedEndpointAlone(t *testing.T) {
 	defer saveGlobals()()
 
@@ -387,12 +352,7 @@ func TestMarkAttemptCategoryLeavesAnUnrelatedEndpointAlone(t *testing.T) {
 	}
 }
 
-// markAttemptCategory identifies the record it may amend positively - the config phase
-// with no category, which is how and only how a successful fetch is sealed - rather than
-// by an empty category alone. Every failure today names a cause, so an empty category does
-// currently imply success; the first fixture below is what that assumption looks like when
-// it stops holding, and matching on it would move this cause onto a failed attempt while
-// leaving the successful fetch, the one actually being downgraded, untouched.
+// The first fixture is a failure with no cause named, which an empty-category match would stamp
 func TestMarkAttemptCategoryOnlyAmendsASuccessfulFetch(t *testing.T) {
 	defer saveGlobals()()
 
@@ -413,9 +373,7 @@ func TestMarkAttemptCategoryOnlyAmendsASuccessfulFetch(t *testing.T) {
 	}
 }
 
-// saveGlobals returns a function that puts the package's log and report globals back the
-// way they were.  Used as `defer saveGlobals()()`, it keeps a test that installs its own
-// globals from coupling every test that runs after it to this one's execution order.
+// saveGlobals restores the package's log and report globals; used as `defer saveGlobals()()`
 func saveGlobals() func() {
 	savedLog, savedReport := gLog, gReport
 
