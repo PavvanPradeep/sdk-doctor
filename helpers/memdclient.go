@@ -205,14 +205,15 @@ func (client *MemdClient) selectBucket(bucket string) error {
 	return nil
 }
 
-// opTimeout bounds a single operation, as a stalled peer would otherwise block the run forever
-const opTimeout = 2000 * time.Millisecond
+// OpTimeout bounds a single operation, as a stalled peer would otherwise block the run forever.
+// Exported so a caller sealing an attempt after an operation can report the budget it really had.
+const OpTimeout = 2000 * time.Millisecond
 
 // GetConfig will fetch a config via CCCP
 func (client *MemdClient) GetConfig() ([]byte, error) {
 	var resp memd.Response
 
-	client.conn.SetDeadline(time.Now().Add(opTimeout))
+	client.conn.SetDeadline(time.Now().Add(OpTimeout))
 	defer client.conn.SetDeadline(time.Time{})
 
 	err := client.conn.WritePacket(&memd.Request{
@@ -240,7 +241,7 @@ func (client *MemdClient) GetConfig() ([]byte, error) {
 func (client *MemdClient) Ping() error {
 	var resp memd.Response
 
-	client.conn.SetDeadline(time.Now().Add(opTimeout))
+	client.conn.SetDeadline(time.Now().Add(OpTimeout))
 	defer client.conn.SetDeadline(time.Time{})
 
 	err := client.conn.WritePacket(&memd.Request{

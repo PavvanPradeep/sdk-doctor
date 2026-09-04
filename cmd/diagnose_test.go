@@ -652,8 +652,8 @@ func TestFetchHTTPTerseBucketConfigReportsAHungTLSServerAsResponse(t *testing.T)
 	}
 }
 
-// Selecting the config and only then rejecting it printed "cannot be used" and used it anyway
-func TestScanTerseConfigListRejectsAConfigThatDescribesNoNodeOfItsOwn(t *testing.T) {
+// Rejecting this config aborted diagnosis, though every downstream consumer tolerates a nil thisNode
+func TestScanTerseConfigListStillUsesAConfigThatDescribesNoNodeOfItsOwn(t *testing.T) {
 	defer saveGlobals()()
 
 	var out bytes.Buffer
@@ -670,20 +670,59 @@ func TestScanTerseConfigListRejectsAConfigThatDescribesNoNodeOfItsOwn(t *testing
 		NodesExt: []bucketConfigNodeExt{{Hostname: "hostB", Services: map[string]int{"kv": 11210}}},
 	}}
 
-	if got := scanTerseConfigList(hosts, configs); got != nil {
-		t.Errorf("expected no usable master config, got %+v", got)
+	got := scanTerseConfigList(hosts, configs)
+	if got == nil {
+		t.Fatal("expected the config to remain usable, got no master config")
+	}
+	if got.UUID != "abc" {
+		t.Errorf("selected config UUID = %q, want %q", got.UUID, "abc")
 	}
 
-	if !strings.Contains(out.String(), "does not describe the node") {
-		t.Errorf("expected the rejection to be reported, got:\n%s", out.String())
+	if !strings.Contains(out.String(), "does not identify which node") {
+		t.Errorf("expected the condition to be reported, got:\n%s", out.String())
 	}
 
-	if got := gReport.Attempts[0].Category; got != string(helpers.CategoryConfigEmpty) {
-		t.Errorf("attempt category = %q, want %q", got, helpers.CategoryConfigEmpty)
+	// The fetch succeeded, so marking it failed would name a cause that did not occur
+	if got := gReport.Attempts[0].Category; got != "" {
+		t.Errorf("attempt category = %q, want it left unset", got)
 	}
 }
 
-// A later host's good configuration must still be usable after an earlier one was rejected
+// The whole point of keeping the config: it still yields a complete node list
+func TestScanTerseConfigListYieldsUsableNodesWithoutAThisNodeEntry(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+
+	hosts := []gocbconnstr.Address{{Host: "node1", Port: 8091}}
+	configs := []*terseBucketConfig{{
+		UUID: "abc",
+		NodesExt: []bucketConfigNodeExt{
+			{Hostname: "node1", Services: map[string]int{"kv": 11210, "mgmt": 8091}},
+			{Hostname: "node2", Services: map[string]int{"kv": 11210, "mgmt": 8091}},
+		},
+		SourceHost: "node1",
+		SourcePort: 8091,
+	}}
+
+	master := scanTerseConfigList(hosts, configs)
+	if master == nil {
+		t.Fatal("expected a usable master config")
+	}
+
+	if network := networkFromTerseBucketConfig(*master); network != "default" {
+		t.Errorf("network = %q, want %q", network, "default")
+	}
+
+	nodes := nodesFromMasterConfig(*master, "default")
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	}
+}
+
+// A host that returned nothing at all must not stop a later host's config from being used
 func TestScanTerseConfigListFallsThroughToTheNextUsableConfig(t *testing.T) {
 	defer saveGlobals()()
 
@@ -693,7 +732,7 @@ func TestScanTerseConfigListFallsThroughToTheNextUsableConfig(t *testing.T) {
 
 	hosts := []gocbconnstr.Address{{Host: "hostA", Port: 8091}, {Host: "hostB", Port: 8091}}
 	configs := []*terseBucketConfig{
-		{UUID: "abc", NodesExt: []bucketConfigNodeExt{{Hostname: "hostZ"}}},
+		nil,
 		{UUID: "def", NodesExt: []bucketConfigNodeExt{{ThisNode: true, Hostname: "hostB"}}},
 	}
 
@@ -767,5 +806,60 @@ func TestNodesFromMasterConfigKeepsTheDefaultNetwork(t *testing.T) {
 
 	if got := nodesFromMasterConfig(config, "default"); len(got) != 2 {
 		t.Errorf("expected both nodes, got %+v", got)
+	}
+}
+
+// A config describing no nodes at all is empty, not a config whose network is missing
+func TestNodesFromMasterConfigReportsAConfigWithNoNodesAsEmpty(t *testing.T) {
+	defer saveGlobals()()
+
+	var out bytes.Buffer
+	gLog = helpers.Logger{}
+	gLog.SetOutput(&out)
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "hostA:8091", helpers.PhaseConfig, ""),
+	}
+
+	config := terseBucketConfig{
+		UUID:       "abc",
+		NodesExt:   nil,
+		SourceHost: "hostA",
+		SourcePort: 8091,
+	}
+
+	if nodes := nodesFromMasterConfig(config, "default"); nodes != nil {
+		t.Fatalf("expected no node list, got %+v", nodes)
+	}
+
+	if !strings.Contains(out.String(), "describes no nodes") {
+		t.Errorf("expected an empty-config report, got:\n%s", out.String())
+	}
+
+	if got := gReport.Attempts[0].Category; got != string(helpers.CategoryConfigEmpty) {
+		t.Errorf("attempt category = %q, want %q", got, helpers.CategoryConfigEmpty)
+	}
+}
+
+// Splitting the endpoint only to rejoin it mangles anything net.SplitHostPort cannot parse
+func TestLogConnectPhasesPrintsTheEndpointVerbatim(t *testing.T) {
+	defer saveGlobals()()
+
+	for _, endpoint := range []string{"[::1]:11210", "::1:11210", "node1:11210"} {
+		var out bytes.Buffer
+		gLog = helpers.Logger{}
+		gLog.SetOutput(&out)
+		gReport = diagnosticReport{}
+
+		logConnectPhases(helpers.Attempt{
+			Kind:     "service-kv",
+			Endpoint: endpoint,
+			TCP:      "1ms",
+		}, memd.ConnectTiming{})
+
+		want := "Connect phases for `" + endpoint + "`:"
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("expected %q, got:\n%s", want, out.String())
+		}
 	}
 }

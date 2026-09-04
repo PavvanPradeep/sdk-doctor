@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/couchbaselabs/gocbconnstr"
 	"github.com/couchbaselabs/sdk-doctor/helpers"
 )
 
@@ -379,5 +380,116 @@ func saveGlobals() func() {
 
 	return func() {
 		gLog, gReport = savedLog, savedReport
+	}
+}
+
+// The rank order is the whole mechanism for leading with the most actionable cause, so it is
+// pinned literally here: deriving the expectation from categoryRank itself would pass under any
+// reordering of it, which is precisely the regression this guards.
+func TestCategoryRankOrdersTheMostActionableCauseFirst(t *testing.T) {
+	want := []helpers.Category{
+		helpers.CategoryAuthRejected,
+		helpers.CategoryBucketForbidden,
+		helpers.CategoryBucketNotFound,
+		helpers.CategoryTLSVerify,
+		helpers.CategoryTLSHandshake,
+		helpers.CategoryResponseTimeout,
+		helpers.CategoryCCCPUnsupported,
+		helpers.CategoryConfigInvalid,
+		helpers.CategoryConfigEmpty,
+		helpers.CategoryServerError,
+		helpers.CategoryUnknown,
+	}
+
+	if len(categoryRank) != len(want) {
+		t.Fatalf("categoryRank has %d entries, want %d: %v", len(categoryRank), len(want), categoryRank)
+	}
+
+	for i := range want {
+		if categoryRank[i] != want[i] {
+			t.Errorf("categoryRank[%d] = %q, want %q", i, categoryRank[i], want[i])
+		}
+	}
+
+	// Unknown must stay last, or it outranks every cause the doctor can actually name
+	if categoryRank[len(categoryRank)-1] != helpers.CategoryUnknown {
+		t.Errorf("expected %q to rank last, got %q",
+			helpers.CategoryUnknown, categoryRank[len(categoryRank)-1])
+	}
+}
+
+// The live wrong-bucket shape: CCCP reports unknown (the server closes the connection) while
+// HTTP names the real cause.  If unknown wins, the headline loses the only actionable fact.
+func TestBootstrapSummaryPrefersANamedCauseOverUnknown(t *testing.T) {
+	attempts := []helpers.Attempt{
+		attempt("bootstrap-cccp", "node1:11210", helpers.PhaseSelectBucket, helpers.CategoryUnknown),
+		attempt("bootstrap-http-terse", "node1:8091", helpers.PhaseResponse, helpers.CategoryBucketNotFound),
+	}
+
+	got := bootstrapSummary(attempts, "travel")
+
+	if !strings.Contains(got, "Bucket `travel` does not exist") {
+		t.Errorf("expected the named cause to lead, got:\n%s", got)
+	}
+
+	if strings.Contains(got, "does not recognise") {
+		t.Errorf("expected unknown not to lead, got:\n%s", got)
+	}
+}
+
+// Auth is the most actionable cause there is; nothing may displace it
+func TestBootstrapSummaryRanksAuthAboveEveryOtherNamedCause(t *testing.T) {
+	for _, other := range categoryRank {
+		if other == helpers.CategoryAuthRejected {
+			continue
+		}
+
+		attempts := []helpers.Attempt{
+			attempt("bootstrap-cccp", "node1:11210", helpers.PhaseConfig, other),
+			attempt("bootstrap-http-terse", "node1:8091", helpers.PhaseSASL, helpers.CategoryAuthRejected),
+		}
+
+		if got := bootstrapSummary(attempts, "travel"); !strings.Contains(got, "Authentication was rejected") {
+			t.Errorf("auth did not lead against %q, got:\n%s", other, got)
+		}
+	}
+}
+
+// Two bootstrap hosts can resolve to the same endpoint string (an LB, or a repeated host), so
+// markAttemptCategory matching on endpoint alone is only sound because the master is always the
+// FIRST config that succeeded.  Here the first config is usable and the second is not: prefer the
+// later one and the unusable config's category lands on the earlier, working record.
+func TestMarkAttemptCategoryBlamesTheMastersOwnRecordOnADuplicateEndpoint(t *testing.T) {
+	defer saveGlobals()()
+
+	gLog = helpers.Logger{}
+	gLog.SetOutput(devNull{})
+	gReport = diagnosticReport{}
+	gReport.Attempts = []helpers.Attempt{
+		attempt("bootstrap-http-terse", "lb:8091", helpers.PhaseConfig, ""),
+		attempt("bootstrap-http-terse", "lb:8091", helpers.PhaseConfig, ""),
+	}
+
+	hosts := []gocbconnstr.Address{{Host: "lb", Port: 8091}, {Host: "lb", Port: 8091}}
+	configs := []*terseBucketConfig{
+		{UUID: "abc", SourceHost: "lb", SourcePort: 8091,
+			NodesExt: []bucketConfigNodeExt{{Hostname: "lb", Services: map[string]int{"kv": 11210}}}},
+		{UUID: "abc", SourceHost: "lb", SourcePort: 8091, NodesExt: nil},
+	}
+
+	master := scanTerseConfigList(hosts, configs)
+	if master == nil {
+		t.Fatal("expected the first host's config to be selected")
+	}
+
+	if nodes := nodesFromMasterConfig(*master, "default"); len(nodes) != 1 {
+		t.Fatalf("expected the usable first config to yield 1 node, got %d", len(nodes))
+	}
+
+	// The usable config was chosen, so no record may be blamed for an unusable one
+	for i, a := range gReport.Attempts {
+		if a.Category != "" {
+			t.Errorf("attempt[%d] was blamed with %q though the master config was usable", i, a.Category)
+		}
 	}
 }

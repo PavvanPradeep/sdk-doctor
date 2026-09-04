@@ -221,6 +221,12 @@ func CategoryForMemdStatus(status memd.StatusCode) Category {
 
 // CategoryForConfigStatus maps a failed config fetch, preferring a named cause over "unsupported"
 func CategoryForConfigStatus(status memd.StatusCode) Category {
+	// The bucket is already established on this connection by the time a config is fetched, so
+	// KEY_ENOENT here means no configuration was available, not that the bucket is missing
+	if status == memd.StatusKeyNotFound {
+		return CategoryConfigEmpty
+	}
+
 	if category := CategoryForMemdStatus(status); category != CategoryUnknown {
 		return category
 	}
@@ -281,6 +287,14 @@ func NewAttempt(kind, endpoint string, timeout time.Duration) *AttemptBuilder {
 func (b *AttemptBuilder) WithTiming(timing memd.ConnectTiming, sasl time.Duration) *AttemptBuilder {
 	b.timing = timing
 	b.sasl = sasl
+
+	return b
+}
+
+// AddBudget widens the timeout this attempt reports, for an operation that carries its own
+// deadline after the dial's has been cleared
+func (b *AttemptBuilder) AddBudget(d time.Duration) *AttemptBuilder {
+	b.timeout += d
 
 	return b
 }

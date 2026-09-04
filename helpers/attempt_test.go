@@ -199,7 +199,9 @@ func TestCategoryForConfigStatusKeepsMeaningfulStatuses(t *testing.T) {
 		{memd.StatusNotSupported, CategoryCCCPUnsupported},
 		{memd.StatusAccessError, CategoryBucketForbidden},
 		{memd.StatusAuthError, CategoryAuthRejected},
-		{memd.StatusKeyNotFound, CategoryBucketNotFound},
+		// select_bucket has already succeeded for this bucket by the time a config is fetched,
+		// so KEY_ENOENT here cannot mean the bucket is missing: it means no config is available
+		{memd.StatusKeyNotFound, CategoryConfigEmpty},
 	}
 
 	for _, test := range tests {
@@ -281,5 +283,40 @@ func TestDurMatchesTheReportFormat(t *testing.T) {
 		if got := Dur(test.in); got != test.want {
 			t.Errorf("Dur(%d) = %q, want %q", test.in, got, test.want)
 		}
+	}
+}
+
+// The select-bucket path keeps the other meaning of KEY_ENOENT, where the bucket really is missing
+func TestCategoryForMemdStatusStillReadsKeyNotFoundAsAMissingBucket(t *testing.T) {
+	if got := CategoryForMemdStatus(memd.StatusKeyNotFound); got != CategoryBucketNotFound {
+		t.Errorf("CategoryForMemdStatus(KeyNotFound) = %q, want %q", got, CategoryBucketNotFound)
+	}
+}
+
+// A CCCP attempt is sealed only after GetConfig, which applies its own timeout once the dial
+// deadline is cleared.  Reporting just the dial budget made Elapsed look like an overrun.
+func TestAttemptBuilderAddBudgetExtendsTheReportedTimeout(t *testing.T) {
+	builder := NewAttempt("bootstrap-cccp", "node1:11210", 2000*time.Millisecond)
+
+	builder.AddBudget(OpTimeout)
+
+	got := builder.Finish(PhaseConfig, "", nil).Timeout
+	if got != "4s" {
+		t.Errorf("Timeout = %q, want %q", got, "4s")
+	}
+}
+
+// Without the extension the record claims a 2s bound for work that may legitimately take longer
+func TestDialStartsTheAttemptAtTheDialBudget(t *testing.T) {
+	host, port, closeFn := startFakeServer(t, nil)
+	defer closeFn()
+
+	_, builder, err := Dial("bootstrap-cccp", host, port, "travel", "Administrator", "password", nil)
+	if err != nil {
+		t.Fatalf("Dial failed: %s", err)
+	}
+
+	if got := builder.Finish(PhaseSASL, "", nil).Timeout; got != "2s" {
+		t.Errorf("Timeout = %q, want the dial budget %q", got, "2s")
 	}
 }

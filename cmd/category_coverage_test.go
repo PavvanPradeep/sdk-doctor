@@ -3,7 +3,6 @@ package cmd
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -98,7 +97,11 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 	if emptyConfig.GetSourceNodeExt() != nil {
 		t.Fatalf("expected the test config to describe no node of its own, got %+v", emptyConfig.GetSourceNodeExt())
 	}
-	markAttemptCategory(fmt.Sprintf("%s:%d", emptyHost, emptyPort), helpers.CategoryConfigEmpty)
+
+	// Driven through real code, so an unreachable category cannot be faked by the test itself
+	if nodes := nodesFromMasterConfig(emptyConfig, "default"); nodes != nil {
+		t.Fatalf("expected no node list from an empty config, got %+v", nodes)
+	}
 
 	if len(gReport.Attempts) != 1 {
 		t.Fatalf("expected exactly one recorded attempt, got %d", len(gReport.Attempts))

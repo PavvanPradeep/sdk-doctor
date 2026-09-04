@@ -111,25 +111,14 @@ func logConnectPhases(attempt helpers.Attempt, timing memd.ConnectTiming) {
 		phases += fmt.Sprintf(", sasl %s", attempt.SASL)
 	}
 
-	host, port := splitEndpoint(attempt.Endpoint)
-	gLog.Log("Connect phases for `%s:%s`: %s", host, port, phases)
+	gLog.Log("Connect phases for `%s`: %s", attempt.Endpoint, phases)
 
 	if tcpSlowerThanDNS(timing) {
 		gLog.Warn(
-			"TCP handshake to `%s:%s` took %s against %s for DNS resolution --"+
+			"TCP handshake to `%s` took %s against %s for DNS resolution --"+
 				" latency appears to be on the network path, not name resolution.",
-			host, port, attempt.TCP, attempt.DNS)
+			attempt.Endpoint, attempt.TCP, attempt.DNS)
 	}
-}
-
-// splitEndpoint breaks a "host:port" endpoint back into its parts for logging
-func splitEndpoint(endpoint string) (host, port string) {
-	host, port, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		return endpoint, ""
-	}
-
-	return host, port
 }
 
 // tcpSlowerThanDNS reports whether the handshake dominated resolution by enough to be worth telling the user about
@@ -487,17 +476,14 @@ func scanTerseConfigList(hosts []gocbconnstr.Address, configs []*terseBucketConf
 			continue
 		}
 
-		// Checked before this config can become the master, so it is not used after being rejected
+		// Reported, not rejected: the network defaults and the node list is built from nodesExt
 		thisNodeExt := config.GetSourceNodeExt()
 		if thisNodeExt == nil {
-			gLog.Error(
-				"Bootstrap host `%s` returned a configuration that does not describe the node"+
-					" itself, so it cannot be used.",
+			gLog.Warn(
+				"Bootstrap host `%s` returned a configuration that does not identify which node"+
+					" served it.  Node-specific checks are skipped for it and the `default`"+
+					" network is assumed.",
 				target.Host)
-
-			markAttemptCategory(fmt.Sprintf("%s:%d", target.Host, target.Port), helpers.CategoryConfigEmpty)
-
-			continue
 		}
 
 		if masterConfig == nil {
@@ -512,7 +498,7 @@ func scanTerseConfigList(hosts []gocbconnstr.Address, configs []*terseBucketConf
 			}
 		}
 
-		if thisNodeExt.Hostname != "" && target.Host != thisNodeExt.Hostname {
+		if thisNodeExt != nil && thisNodeExt.Hostname != "" && target.Host != thisNodeExt.Hostname {
 			gLog.Warn(
 				"Bootstrap host `%s` is not using the canonical node hostname of `%s`.  This"+
 					" is not neccessarily an error, but has been known to result in strange and"+
@@ -531,13 +517,26 @@ func nodesFromMasterConfig(config terseBucketConfig, networkType string) []clust
 		return nodes
 	}
 
-	gLog.Error(
-		"The configuration from `%s:%d` does not describe the `%s` network on every node,"+
-			" so no usable node list could be built from it.",
-		config.SourceHost, config.SourcePort, networkType)
+	endpoint := fmt.Sprintf("%s:%d", config.SourceHost, config.SourcePort)
 
-	markAttemptCategory(fmt.Sprintf("%s:%d", config.SourceHost, config.SourcePort),
-		helpers.CategoryConfigInvalid)
+	// A config listing no nodes at all is a different fault from one missing the chosen network
+	if len(config.NodesExt) == 0 {
+		gLog.Error(
+			"The configuration from `%s` describes no nodes, so no usable node list could"+
+				" be built from it.",
+			endpoint)
+
+		markAttemptCategory(endpoint, helpers.CategoryConfigEmpty)
+
+		return nil
+	}
+
+	gLog.Error(
+		"The configuration from `%s` does not describe the `%s` network on every node,"+
+			" so no usable node list could be built from it.",
+		endpoint, networkType)
+
+	markAttemptCategory(endpoint, helpers.CategoryConfigInvalid)
 
 	return nil
 }
@@ -686,6 +685,10 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 		return terseBucketConfig{}, builder.FromDial(err), err
 	}
 	defer client.Close()
+
+	// GetConfig runs after the dial deadline is cleared and carries its own, so the attempt's
+	// reported budget must cover it or Elapsed can exceed a Timeout that never applied
+	builder.AddBudget(helpers.OpTimeout)
 
 	configBytes, err := client.GetConfig()
 	if err != nil {
