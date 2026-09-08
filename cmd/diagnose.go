@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -52,22 +54,39 @@ func logTLSChainInfo(host string, port int, info helpers.TLSChainInfo) {
 			i, cert.Subject, cert.Issuer, cert.NotAfter.Format("2006-01-02"))
 
 		// An expiring intermediate breaks the chain just as a leaf does
-		if cert.DaysToExpiry < 0 {
+		if time.Until(cert.NotAfter) < 0 {
+			expiry := fmt.Sprintf("expired %d days ago", -cert.DaysToExpiry)
+			if cert.DaysToExpiry == 0 {
+				expiry = "expired less than a day ago"
+			}
+
 			gLog.Error(
-				"Certificate `%s` presented by `%s:%d` expired %d days ago (%s).",
-				cert.Subject, host, port, -cert.DaysToExpiry, cert.NotAfter.Format("2006-01-02"))
+				"Certificate `%s` presented by `%s:%d` %s (%s).",
+				cert.Subject, host, port, expiry, cert.NotAfter.Format("2006-01-02"))
 		} else if cert.DaysToExpiry <= certExpiryWarnDays {
+			expiry := fmt.Sprintf("expires in %d days", cert.DaysToExpiry)
+			if cert.DaysToExpiry == 0 {
+				expiry = "expires in less than a day"
+			}
+
 			gLog.Warn(
-				"Certificate `%s` presented by `%s:%d` expires in %d days (%s).",
-				cert.Subject, host, port, cert.DaysToExpiry, cert.NotAfter.Format("2006-01-02"))
+				"Certificate `%s` presented by `%s:%d` %s (%s).",
+				cert.Subject, host, port, expiry, cert.NotAfter.Format("2006-01-02"))
 		}
 	}
 
 	if !info.HostMatches {
-		gLog.Error(
-			"Dialed hostname `%s` is not present in the certificate's subject alternative"+
-				" names %v for `%s:%d`.",
-			info.DialedHost, info.LeafSANs, host, port)
+		if len(info.LeafSANs) == 0 {
+			gLog.Error(
+				"Dialed hostname `%s` cannot be verified: the certificate presented by `%s:%d`"+
+					" carries no subject alternative names.",
+				info.DialedHost, host, port)
+		} else {
+			gLog.Error(
+				"Dialed hostname `%s` is not present in the certificate's subject alternative"+
+					" names %v for `%s:%d`.",
+				info.DialedHost, info.LeafSANs, host, port)
+		}
 	}
 }
 
@@ -111,7 +130,7 @@ func logConnectPhases(attempt helpers.Attempt, timing memd.ConnectTiming) {
 		phases += fmt.Sprintf(", sasl %s", attempt.SASL)
 	}
 
-	gLog.Log("Connect phases for `%s`: %s", attempt.Endpoint, phases)
+	gLog.Log("Connect phases for `%s`: %s%s", attempt.Endpoint, phases, socketPath(attempt))
 
 	if tcpSlowerThanDNS(timing) {
 		gLog.Warn(
@@ -121,73 +140,192 @@ func logConnectPhases(attempt helpers.Attempt, timing memd.ConnectTiming) {
 	}
 }
 
+func socketPath(attempt helpers.Attempt) string {
+	for _, address := range attempt.Addresses {
+		if address.Error != "" || address.Local == "" {
+			continue
+		}
+
+		path := fmt.Sprintf(" (%s -> %s, %s", address.Local, address.Address, address.Family)
+		if address.Interface != "" {
+			path += fmt.Sprintf(" via %s", address.Interface)
+		}
+
+		if len(attempt.Resolved) > 1 {
+			path += fmt.Sprintf(", %d addresses resolved", len(attempt.Resolved))
+		}
+
+		return path + ")"
+	}
+
+	return ""
+}
+
 // tcpSlowerThanDNS reports whether the handshake dominated resolution by enough to be worth telling the user about
 func tcpSlowerThanDNS(timing memd.ConnectTiming) bool {
 	return timing.TCP() > 20*time.Millisecond && timing.DNS() > 0 && timing.TCP() > 5*timing.DNS()
 }
 
-// traceRequest reports the per-phase timing and whether the TLS handshake ran to completion
-func traceRequest(req *http.Request) (*http.Request, func() memd.ConnectTiming, func() bool) {
-	var lock sync.Mutex
-	var timing memd.ConnectTiming
-	var tlsHandshakeDone bool
+type httpTrace struct {
+	lock sync.Mutex
 
-	stamp := func(phase *time.Time) {
-		lock.Lock()
-		*phase = time.Now()
-		lock.Unlock()
+	timing           memd.ConnectTiming
+	tlsHandshakeDone bool
+
+	resolved  []string
+	addresses []memd.AddressResult
+
+	starts map[string]time.Time
+
+	wroteRequest time.Time
+	firstByte    time.Time
+}
+
+func (t *httpTrace) Timing() memd.ConnectTiming {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.timing
+}
+
+func (t *httpTrace) TLSHandshakeDone() bool {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.tlsHandshakeDone
+}
+
+func (t *httpTrace) Resolved() []string {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.resolved
+}
+
+func (t *httpTrace) Addresses() []memd.AddressResult {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.addresses
+}
+
+func (t *httpTrace) Latency() (time.Duration, bool) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.wroteRequest.IsZero() || t.firstByte.IsZero() {
+		return 0, false
 	}
 
-	// A dual-stack host races its addresses, so starts are paired by address, not by order
-	starts := map[string]time.Time{}
+	return t.firstByte.Sub(t.wroteRequest), true
+}
 
-	connectStart := func(_, addr string) {
-		lock.Lock()
-		starts[addr] = time.Now()
-		lock.Unlock()
+func (t *httpTrace) stamp(phase *time.Time) {
+	t.lock.Lock()
+	*phase = time.Now()
+	t.lock.Unlock()
+}
+
+func (t *httpTrace) connectStart(_, addr string) {
+	t.lock.Lock()
+	t.starts[addr] = time.Now()
+	t.lock.Unlock()
+}
+
+func (t *httpTrace) connectDone(_, addr string, err error) {
+	if errors.Is(err, context.Canceled) {
+		return
 	}
 
-	connectDone := func(_, addr string, err error) {
-		lock.Lock()
-		defer lock.Unlock()
+	t.lock.Lock()
+	defer t.lock.Unlock()
 
-		// A failed attempt stays unstamped, which is what marks a service as never reached
-		if start, ok := starts[addr]; err == nil && ok {
-			timing.TCPStart = start
-			timing.TCPDone = time.Now()
+	now := time.Now()
+
+	start, started := t.starts[addr]
+	if !started {
+		start = now
+	}
+
+	if err == nil && started {
+		t.timing.TCPStart = start
+		t.timing.TCPDone = now
+	}
+
+	t.addresses = append(t.addresses, memd.AddressResult{
+		Address: addr,
+		Start:   start,
+		Done:    now,
+		Err:     err,
+	})
+}
+
+func (t *httpTrace) gotConn(info httptrace.GotConnInfo) {
+	if info.Conn == nil {
+		return
+	}
+
+	remote := info.Conn.RemoteAddr().String()
+	local := info.Conn.LocalAddr().String()
+
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if _, ok := info.Conn.(*tls.Conn); ok {
+		t.tlsHandshakeDone = true
+	}
+
+	for i := range t.addresses {
+		if t.addresses[i].Address == remote && t.addresses[i].Err == nil {
+			t.addresses[i].Local = local
+			return
 		}
 	}
 
+	t.addresses = append(t.addresses, memd.AddressResult{Address: remote, Local: local})
+}
+
+func traceRequest(req *http.Request) (*http.Request, *httpTrace) {
+	collected := &httpTrace{starts: map[string]time.Time{}}
+
 	trace := &httptrace.ClientTrace{
-		DNSStart:          func(httptrace.DNSStartInfo) { stamp(&timing.DNSStart) },
-		DNSDone:           func(httptrace.DNSDoneInfo) { stamp(&timing.DNSDone) },
-		ConnectStart:      connectStart,
-		ConnectDone:       connectDone,
-		TLSHandshakeStart: func() { stamp(&timing.TLSStart) },
-		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
-			lock.Lock()
-			timing.TLSDone = time.Now()
-			// The callback fires either way, so its error is the only signal that separates the two
-			tlsHandshakeDone = err == nil
-			lock.Unlock()
+		DNSStart: func(httptrace.DNSStartInfo) { collected.stamp(&collected.timing.DNSStart) },
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			collected.lock.Lock()
+			collected.timing.DNSDone = time.Now()
+			for _, addr := range info.Addrs {
+				collected.resolved = append(collected.resolved, addr.IP.String())
+			}
+			collected.lock.Unlock()
 		},
+		ConnectStart:      collected.connectStart,
+		ConnectDone:       collected.connectDone,
+		GotConn:           collected.gotConn,
+		TLSHandshakeStart: func() { collected.stamp(&collected.timing.TLSStart) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			collected.lock.Lock()
+			collected.timing.TLSDone = time.Now()
+			collected.tlsHandshakeDone = err == nil
+			collected.lock.Unlock()
+		},
+		WroteRequest:         func(httptrace.WroteRequestInfo) { collected.stamp(&collected.wroteRequest) },
+		GotFirstResponseByte: func() { collected.stamp(&collected.firstByte) },
 	}
 
-	read := func() memd.ConnectTiming {
-		lock.Lock()
-		defer lock.Unlock()
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), collected
+}
 
-		return timing
+func connectedPhase(trace *httpTrace) helpers.Phase {
+	if trace.TLSHandshakeDone() {
+		return helpers.PhaseTLS
 	}
 
-	handshaken := func() bool {
-		lock.Lock()
-		defer lock.Unlock()
+	return helpers.PhaseTCP
+}
 
-		return tlsHandshakeDone
-	}
-
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), read, handshaken
+func withSocket(builder *helpers.AttemptBuilder, trace *httpTrace) *helpers.AttemptBuilder {
+	return builder.WithTiming(trace.Timing(), 0).
+		WithResolved(trace.Resolved()).
+		WithAddresses(trace.Addresses(), connectedPhase(trace))
 }
 
 // httpFailurePhase names the phase a failed request died in, from the trace not the error text
@@ -517,7 +655,7 @@ func nodesFromMasterConfig(config terseBucketConfig, networkType string) []clust
 		return nodes
 	}
 
-	endpoint := fmt.Sprintf("%s:%d", config.SourceHost, config.SourcePort)
+	endpoint := net.JoinHostPort(config.SourceHost, strconv.Itoa(config.SourcePort))
 
 	// A config listing no nodes at all is a different fault from one missing the chosen network
 	if len(config.NodesExt) == 0 {
@@ -604,6 +742,77 @@ const httpConfigBudget = 2000 * time.Millisecond
 // serviceProbeBudget bounds a service probe, and is what its attempt record reports
 const serviceProbeBudget = 2000 * time.Millisecond
 
+type httpProbeVerdict int
+
+const (
+	probeReachable httpProbeVerdict = iota
+	probeHealthy
+	probeHealthUntested
+	probeUnhealthy
+)
+
+var healthPaths = map[string]string{
+	"mgmt": "/pools", "n1ql": "/admin/ping",
+	"cbas": "/admin/ping", "fts": "/api/ping",
+}
+
+func verdictForStatus(healthEndpoint bool, status int) httpProbeVerdict {
+	switch {
+	case status >= 500:
+		return probeUnhealthy
+	case !healthEndpoint:
+		return probeReachable
+	case status >= 400 && status != http.StatusNotFound:
+		return probeUnhealthy
+	case status/100 != 2:
+		return probeHealthUntested
+	default:
+		return probeHealthy
+	}
+}
+
+func newServiceProbeClient(tlsConfig *tls.Config) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+		Timeout:   serviceProbeBudget,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+const maxProbeBody = 256
+
+func boundedBody(body io.Reader) string {
+	data, _ := ioutil.ReadAll(io.LimitReader(body, maxProbeBody))
+
+	return strings.ToValidUTF8(strings.Join(strings.Fields(string(data)), " "), "")
+}
+
+func bodyClause(body string) string {
+	if body == "" {
+		return ""
+	}
+
+	return fmt.Sprintf(" (response: %s)", body)
+}
+
+func latencyClause(latency string) string {
+	if latency == "" {
+		return ""
+	}
+
+	return fmt.Sprintf(" in %s", latency)
+}
+
+func redirectClause(destination string) string {
+	if destination == "" {
+		return ""
+	}
+
+	return fmt.Sprintf(" redirecting to `%s`", destination)
+}
+
 func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, helpers.Attempt, error) {
 	if user == "" {
 		user = bucket
@@ -622,28 +831,27 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 		scheme = "https"
 	}
 
-	endpoint := fmt.Sprintf("%s:%d", host, port)
+	endpoint := net.JoinHostPort(host, strconv.Itoa(port))
 	builder := helpers.NewAttempt("bootstrap-http-terse", endpoint, httpConfigBudget)
 
-	uri := fmt.Sprintf("%s://%s:%d/pools/default/b/%s", scheme, host, port, bucket)
+	uri := fmt.Sprintf("%s://%s/pools/default/b/%s", scheme, endpoint, bucket)
 	req, _ := http.NewRequest("GET", uri, nil)
 	req.SetBasicAuth(user, pass)
 
 	// The same tracer the HTTP service probe uses, so both paths report the same phases
-	req, phases, tlsHandshakeDone := traceRequest(req)
+	req, trace := traceRequest(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		timing := phases()
-		phase := httpFailurePhase(timing, tlsHandshakeDone(), err)
+		phase := httpFailurePhase(trace.Timing(), trace.TLSHandshakeDone(), err)
 
-		attempt := builder.WithTiming(timing, 0).Finish(phase, helpers.Classify(phase, err), err)
+		attempt := withSocket(builder, trace).Finish(phase, helpers.Classify(phase, err), err)
 
 		return terseBucketConfig{}, attempt, err
 	}
 	defer resp.Body.Close()
 
-	builder.WithTiming(phases(), 0)
+	withSocket(builder, trace)
 
 	if resp.StatusCode != 200 {
 		category := helpers.CategoryForHTTPStatus(resp.StatusCode)
@@ -966,9 +1174,9 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 
 		if len(refused) > 0 && len(open) > 0 {
 			gLog.Warn(
-				"Port %d (%s) is refused on `%s` but open on %d other node(s).  Nothing is"+
-					" listening there, which indicates the service is down on those nodes rather"+
-					" than a network problem.",
+				"Port %d (%s) is refused on `%s` but open on %d other node(s).  Either nothing"+
+					" is listening there, or a firewall is rejecting the connection rather than"+
+					" dropping it.",
 				p.Port, p.Name, strings.Join(refused, ", "), len(open))
 		}
 	}
@@ -982,8 +1190,8 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	for _, hosts := range hostGroups {
 		gLog.Warn(
 			"Cluster advertises %d client-facing port(s) on `%s` which refuse connections: %s."+
-				"  Nothing is listening on them, so clients using those services will fail to"+
-				" connect.",
+				"  Either nothing is listening on them, or a firewall is rejecting the"+
+				" connections; either way clients using those services will fail to connect.",
 			len(refusedAdvertised[hosts]), hosts, strings.Join(refusedAdvertised[hosts], ", "))
 	}
 }
@@ -1298,9 +1506,6 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		}
 	}
 
-	// Print out information about which network type was selected
-	gLog.Log("Selected the following network type: %s", selectedNetwork)
-
 	// Failed to bootstrap
 	if nodesList == nil {
 		if len(gReport.Attempts) > 0 {
@@ -1314,6 +1519,9 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 
 		return
 	}
+
+	// Print out information about which network type was selected
+	gLog.Log("Selected the following network type: %s", selectedNetwork)
 
 	gReport.Network = selectedNetwork
 	gReport.ConfigSource = configSource
@@ -1390,7 +1598,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				Timeout:   2000 * time.Millisecond,
 			}
 
-			uri := fmt.Sprintf("%s://%s:%d/pools/default", infoSourceScheme, infoSourceHost, infoSourcePort)
+			uri := fmt.Sprintf("%s://%s/pools/default", infoSourceScheme,
+				net.JoinHostPort(infoSourceHost, strconv.Itoa(infoSourcePort)))
 			req, _ := http.NewRequest("GET", uri, nil)
 			req.SetBasicAuth(username, password)
 
@@ -1410,12 +1619,12 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 						direction = "behind"
 					}
 
-					gReport.ClockSkew = fmt.Sprintf("%s %s the cluster",
-						skew.Round(time.Second), direction)
-
 					if skew < 2*time.Second {
 						gLog.Log("Local clock is in sync with node `%s`", infoSourceHost)
 					} else {
+						gReport.ClockSkew = fmt.Sprintf("%s %s the cluster",
+							skew.Round(time.Second), direction)
+
 						gLog.Log("Local clock is %s %s node `%s`",
 							skew.Round(time.Second), direction, infoSourceHost)
 					}
@@ -1446,18 +1655,12 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	//======================================================================
 	//  SERVICES
 	//======================================================================
-	var svcOk, svcFailed, svcUnreachable, svcRefused int
+	var svcOk, svcFailed, svcUnreachable, svcRefused, svcStatus int
 
 	// One cert covers every service on a node
 	tlsReported := map[string]bool{}
 
-	testHTTPTransport := &http.Transport{
-		TLSClientConfig: tlsConfig,
-	}
-	testHTTPClient := &http.Client{
-		Transport: testHTTPTransport,
-		Timeout:   serviceProbeBudget,
-	}
+	testHTTPClient := newServiceProbeClient(tlsConfig)
 
 	testMemdService := func(node clusterNode, svcName, svcKeyPlain, svcKeySSL string) {
 		svcKey := svcKeyPlain
@@ -1505,56 +1708,118 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 		}
 
 		svcPort := node.Services[svcKey]
-		if svcPort != 0 {
-			uri := fmt.Sprintf("%s://%s:%d/", svcScheme, node.Hostname, svcPort)
-			req, _ := http.NewRequest("GET", uri, nil)
-			// No credentials are set here since we only care that the service responds,
-			//  not that it responds with anything in particular.
-
-			req, phases, tlsHandshakeDone := traceRequest(req)
-
-			builder := helpers.NewAttempt("service-"+svcKeyPlain,
-				fmt.Sprintf("%s:%d", node.Hostname, svcPort), serviceProbeBudget)
-
-			resp, err := testHTTPClient.Do(req)
-			if err != nil {
-				// The bootstrap fetcher's inference, so a rejected cert lands at tls, not tcp
-				timing := phases()
-				phase := httpFailurePhase(timing, tlsHandshakeDone(), err)
-
-				recordAttempt(builder.WithTiming(timing, 0).
-					Finish(phase, helpers.Classify(phase, err), err))
-
-				svcFailed++
-				if helpers.IsConnRefused(err) {
-					svcRefused++
-				} else if httpProbeUnreachable(err, timing) {
-					svcUnreachable++
-				} else if tlsConfig != nil && !tlsReported[node.Hostname] {
-					tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)
-				}
-
-				gLog.Error("Failed to connect to %s service at `%s:%d` (error: %s)",
-					svcName, node.Hostname, node.Services[svcKey], err.Error())
-			} else {
-				resp.Body.Close()
-
-				timing := phases()
-				logConnectPhases(builder.WithTiming(timing, 0).Finish(helpers.PhaseResponse, "", nil), timing)
-
-				svcOk++
-				gLog.Log("Successfully connected to %s service at `%s:%d`",
-					svcName, node.Hostname, node.Services[svcKey])
-
-				if resp.TLS != nil && !tlsReported[node.Hostname] {
-					tlsReported[node.Hostname] = true
-
-					logTLSChainInfo(node.Hostname, svcPort,
-						helpers.BuildTLSChainInfo(resp.TLS, node.Hostname, time.Now()))
-				}
-			}
-		} else {
+		if svcPort == 0 {
 			gLog.Log("Not testing %s service on `%s`, the node does not run it", svcName, node.Hostname)
+			return
+		}
+
+		path, healthEndpoint := healthPaths[svcKeyPlain], true
+		if path == "" {
+			path, healthEndpoint = "/", false
+		}
+
+		endpoint := net.JoinHostPort(node.Hostname, strconv.Itoa(svcPort))
+		uri := fmt.Sprintf("%s://%s%s", svcScheme, endpoint, path)
+		req, _ := http.NewRequest("GET", uri, nil)
+
+		if username != "" {
+			req.SetBasicAuth(username, password)
+		}
+
+		req, trace := traceRequest(req)
+
+		builder := helpers.NewAttempt("service-"+svcKeyPlain, endpoint, serviceProbeBudget)
+
+		resp, err := testHTTPClient.Do(req)
+		if err != nil {
+			timing := trace.Timing()
+			phase := httpFailurePhase(timing, trace.TLSHandshakeDone(), err)
+
+			recordAttempt(withSocket(builder, trace).
+				WithHTTP(helpers.HTTPProbe{Path: path, HealthEndpoint: healthEndpoint}).
+				Finish(phase, helpers.Classify(phase, err), err))
+
+			svcFailed++
+			if helpers.IsConnRefused(err) {
+				svcRefused++
+			} else if httpProbeUnreachable(err, timing) {
+				svcUnreachable++
+			} else if tlsConfig != nil && !tlsReported[node.Hostname] {
+				tlsReported[node.Hostname] = probeTLSChain(node.Hostname, svcPort)
+			}
+
+			gLog.Error("Failed to connect to %s service at `%s:%d` (error: %s)",
+				svcName, node.Hostname, svcPort, err.Error())
+
+			return
+		}
+		defer resp.Body.Close()
+
+		probe := helpers.HTTPProbe{
+			Path:           path,
+			HealthEndpoint: healthEndpoint,
+			Status:         resp.StatusCode,
+			Server:         resp.Header.Get("Server"),
+		}
+		if resp.StatusCode/100 == 3 {
+			probe.Redirect = resp.Header.Get("Location")
+		}
+		if latency, ok := trace.Latency(); ok {
+			probe.Latency = dur(latency)
+		}
+
+		if resp.TLS != nil && !tlsReported[node.Hostname] {
+			tlsReported[node.Hostname] = true
+
+			logTLSChainInfo(node.Hostname, svcPort,
+				helpers.BuildTLSChainInfo(resp.TLS, node.Hostname, time.Now()))
+		}
+
+		if resp.StatusCode >= 400 {
+			probe.Body = boundedBody(resp.Body)
+		}
+
+		verdict := verdictForStatus(healthEndpoint, resp.StatusCode)
+
+		if verdict == probeUnhealthy {
+			statusErr := fmt.Errorf("http status %d", resp.StatusCode)
+			recordAttempt(withSocket(builder, trace).WithHTTP(probe).
+				Finish(helpers.PhaseResponse, helpers.CategoryForServiceHTTPStatus(resp.StatusCode), statusErr))
+
+			svcFailed++
+			svcStatus++
+
+			gLog.Error(
+				"%s service at `%s:%d` answered `%s` with HTTP %d%s.  The endpoint was reached,"+
+					" so this is the service's own answer rather than a network fault.",
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, bodyClause(probe.Body))
+
+			return
+		}
+
+		timing := trace.Timing()
+		logConnectPhases(withSocket(builder, trace).WithHTTP(probe).
+			Finish(helpers.PhaseResponse, "", nil), timing)
+
+		svcOk++
+
+		switch verdict {
+		case probeReachable:
+			gLog.Log(
+				"Successfully connected to %s service at `%s:%d` (HTTP %d%s).  No documented"+
+					" health endpoint exists for this service, so its reachability was tested"+
+					" but its application health was not.",
+				svcName, node.Hostname, svcPort, resp.StatusCode, latencyClause(probe.Latency))
+		case probeHealthUntested:
+			gLog.Warn(
+				"%s service at `%s:%d` answered `%s` with HTTP %d%s rather than serving the"+
+					" documented health endpoint.  The service was reached, but its application"+
+					" health was not tested; an older server version or a proxy in front of the"+
+					" port would both produce this.",
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, redirectClause(probe.Redirect))
+		default:
+			gLog.Log("%s service at `%s:%d` reported healthy on `%s` (HTTP %d%s)",
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, latencyClause(probe.Latency))
 		}
 	}
 
@@ -1588,15 +1853,28 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				" problem: the services are not running, or they are not listening on the ports"+
 				" the cluster advertises on the `%s` network.",
 			svcFailed, selectedNetwork)
-	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 && svcRefused == 0 {
+	} else if svcOk == 0 && svcFailed > 0 && svcStatus == svcFailed {
+		gLog.Error(
+			"Bootstrap succeeded and every one of the %d advertised service endpoints answered,"+
+				" but each one reported an error status rather than health.  The network path and"+
+				" the handshake are both fine, so the fault is in the services themselves or in"+
+				" the credentials' access to them.  The per-service errors above name the status.",
+			svcFailed)
+	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 && svcRefused == 0 && svcStatus == 0 {
+		checks := "that the credentials are valid"
+		if tlsConfig != nil {
+			checks = fmt.Sprintf("that the certificate authority you passed signs the cluster's"+
+				" certificates, that those certificates cover the hostnames the cluster"+
+				" advertises on the `%s` network, and that the credentials are valid",
+				selectedNetwork)
+		}
+
 		gLog.Error(
 			"Bootstrap succeeded and every one of the %d advertised service endpoints accepted"+
 				" the connection, but none of them completed it.  The network path is fine, so"+
-				" the fault is in the handshake itself: check that the certificate authority you"+
-				" passed signs the cluster's certificates, that those certificates cover the"+
-				" hostnames the cluster advertises on the `%s` network, and that the credentials"+
-				" are valid.  The per-service errors above name the specific failure.",
-			svcFailed, selectedNetwork)
+				" the fault is in the handshake itself: check %s.  The per-service errors above"+
+				" name the specific failure.",
+			svcFailed, checks)
 	}
 
 	//======================================================================

@@ -249,3 +249,48 @@ func TestDialMemdConnRecordsTheAddressThatConnected(t *testing.T) {
 		t.Error("expected the local socket address to be recorded")
 	}
 }
+
+func TestDialMemdConnRecordsTheResolvedAddresses(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %s", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to read the listener port: %s", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+
+	literal, err := DialMemdConn(net.JoinHostPort("127.0.0.1", port), nil, deadline)
+	if err != nil {
+		t.Fatalf("dial to the literal failed: %s", err)
+	}
+	defer literal.Conn.Close()
+
+	if len(literal.Resolved) != 0 {
+		t.Errorf("an IP literal reported a resolved set of %v", literal.Resolved)
+	}
+
+	named, err := DialMemdConn(net.JoinHostPort("localhost", port), nil, deadline)
+	if err != nil {
+		t.Skipf("localhost is not usable on this host: %s", err)
+	}
+	defer named.Conn.Close()
+
+	if len(named.Resolved) == 0 {
+		t.Error("a resolved name reported no addresses")
+	}
+}

@@ -259,6 +259,24 @@ func TestCategoryForHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestCategoryForServiceHTTPStatus(t *testing.T) {
+	tests := []struct {
+		code int
+		want Category
+	}{
+		{401, CategoryAuthRejected},
+		{403, CategoryHTTPStatus},
+		{404, CategoryHTTPStatus},
+		{503, CategoryServerError},
+	}
+
+	for _, test := range tests {
+		if got := CategoryForServiceHTTPStatus(test.code); got != test.want {
+			t.Errorf("CategoryForServiceHTTPStatus(%d) = %q, want %q", test.code, got, test.want)
+		}
+	}
+}
+
 func TestClassifyReturnsNoCategoryForSuccess(t *testing.T) {
 	if got := Classify(PhaseConfig, nil); got != "" {
 		t.Errorf("expected an empty category for a nil error, got %q", got)
@@ -328,5 +346,28 @@ func TestDialStartsTheAttemptAtTheDialBudget(t *testing.T) {
 
 	if got := builder.Finish(PhaseSASL, "", nil).Timeout; got != "2s" {
 		t.Errorf("Timeout = %q, want the dial budget %q", got, "2s")
+	}
+}
+
+func TestInterfaceForIP(t *testing.T) {
+	loopback := interfaceForIP("127.0.0.1:53182")
+	if loopback == "" {
+		t.Skip("this host exposes no interface holding 127.0.0.1")
+	}
+
+	if got := interfaceForIP("127.0.0.1"); got != loopback {
+		t.Errorf("a bare address resolved to %q, want the same interface %q", got, loopback)
+	}
+	if got := interfaceForIP("[fe80::1%en0]:53182"); got != "en0" {
+		t.Errorf("a zoned address resolved to %q, want %q", got, "en0")
+	}
+	if got := addressFamily("[fe80::1%en0]:53182"); got != "ipv6" {
+		t.Errorf("a zoned address family is %q, want %q", got, "ipv6")
+	}
+
+	for _, unknown := range []string{"", "203.0.113.1:11210", "not-an-address"} {
+		if got := interfaceForIP(unknown); got != "" {
+			t.Errorf("interfaceForIP(%q) = %q, want no interface", unknown, got)
+		}
 	}
 }

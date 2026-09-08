@@ -223,7 +223,7 @@ func TestTraceRequest(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", srv.URL, nil)
-	req, phases, _ := traceRequest(req)
+	req, trace := traceRequest(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -231,7 +231,7 @@ func TestTraceRequest(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	timing := phases()
+	timing := trace.Timing()
 
 	if timing.TCPStart.IsZero() || timing.TCP() <= 0 {
 		t.Fatalf("tcp phase not recorded: %+v", timing)
@@ -307,7 +307,7 @@ func TestHTTPProbeUnreachable(t *testing.T) {
 
 func TestTraceRequestPairsRacingConnects(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
-	req, phases, _ := traceRequest(req)
+	req, collected := traceRequest(req)
 
 	trace := httptrace.ContextClientTrace(req.Context())
 	trace.ConnectStart("tcp", "[::1]:8091")
@@ -316,20 +316,20 @@ func TestTraceRequestPairsRacingConnects(t *testing.T) {
 	trace.ConnectDone("tcp", "[::1]:8091", errors.New("no route to host"))
 	trace.ConnectDone("tcp", "127.0.0.1:8091", nil)
 
-	if got := phases().TCP(); got > 10*time.Millisecond {
+	if got := collected.Timing().TCP(); got > 10*time.Millisecond {
 		t.Fatalf("expected only the successful attempt to be timed, got %s", got)
 	}
 }
 
 func TestTraceRequestLeavesFailedConnectUnstamped(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://example.invalid/", nil)
-	req, phases, _ := traceRequest(req)
+	req, collected := traceRequest(req)
 
 	trace := httptrace.ContextClientTrace(req.Context())
 	trace.ConnectStart("tcp", "127.0.0.1:8091")
 	trace.ConnectDone("tcp", "127.0.0.1:8091", errors.New("connection refused"))
 
-	timing := phases()
+	timing := collected.Timing()
 	if !timing.TCPDone.IsZero() {
 		t.Fatalf("a failed connect must not stamp the phase, got %s", timing.TCPDone)
 	}
@@ -363,7 +363,7 @@ func TestScanPortMatrixReportsBothRefusalDiagnoses(t *testing.T) {
 		{Hostname: "::1", Services: map[string]int{"mgmt": openPort}},
 	}, false)
 
-	for _, want := range []string{"Cluster advertises", "the service is down on those nodes"} {
+	for _, want := range []string{"Cluster advertises", "a firewall is rejecting the connection"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("expected `%s` in the output:\n%s", want, out.String())
 		}

@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +29,7 @@ func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls
 		user = bucket
 	}
 
-	address := fmt.Sprintf("%s:%d", host, port)
+	address := net.JoinHostPort(host, strconv.Itoa(port))
 	builder := NewAttempt(kind, address, dialBudget)
 
 	deadline := time.Now().Add(dialBudget)
@@ -55,7 +57,9 @@ func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls
 	}
 
 	// Record what the dial learned before authentication, so a later failure keeps it
-	builder.WithTiming(dialResult.Timing, 0).withAddresses(dialResult.Addresses, connectedPhase)
+	builder.WithTiming(dialResult.Timing, 0).
+		WithResolved(dialResult.Resolved).
+		WithAddresses(dialResult.Addresses, connectedPhase)
 
 	saslStart := time.Now()
 	err = client.auth(user, pass)
