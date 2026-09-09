@@ -480,6 +480,7 @@ func runIdleTest(targets []idleTarget, bucket, user, pass string, tlsConfig *tls
 				return
 			}
 			defer client.Close()
+			results[i].attempt = builder.Finish(builder.Reached(), "", nil)
 
 			idleStart := time.Now()
 			time.Sleep(idleFor)
@@ -497,9 +498,9 @@ func runIdleTest(targets []idleTarget, bucket, user, pass string, tlsConfig *tls
 	wg.Wait()
 
 	for i, outcome := range results {
-		if outcome.attempt.Error != "" {
-			recordAttempt(outcome.attempt)
+		recordAttempt(outcome.attempt)
 
+		if outcome.attempt.Error != "" {
 			gLog.Warn(
 				"Not idle-testing `%s:%d`, a connection for the test could not be opened even"+
 					" though sampling had just succeeded on it (error: %s)",
@@ -765,6 +766,7 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 	if thisNode == nil {
 		return "default"
 	}
+	sourceHost := helpers.BareHost(config.SourceHost)
 
 	// Check if we connected using any of the ports associated with the default
 	// configurations that are available.
@@ -774,7 +776,7 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 		hostname = config.SourceHost
 	}
 
-	if hostname == config.SourceHost {
+	if helpers.BareHost(hostname) == sourceHost {
 		for _, svcPort := range thisNode.Services {
 			if svcPort == config.SourcePort {
 				return "default"
@@ -798,7 +800,7 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 			altHostname = hostname
 		}
 
-		if altHostname != config.SourceHost {
+		if helpers.BareHost(altHostname) != sourceHost {
 			continue
 		}
 
@@ -856,6 +858,16 @@ func verdictForStatus(healthEndpoint bool, status int) httpProbeVerdict {
 	}
 }
 
+func tlsConfigForHost(tlsConfig *tls.Config, host string) *tls.Config {
+	if tlsConfig == nil {
+		return nil
+	}
+
+	hostConfig := tlsConfig.Clone()
+	hostConfig.ServerName = helpers.TLSServerName(host)
+	return hostConfig
+}
+
 func newServiceProbeClient(tlsConfig *tls.Config) *http.Client {
 	return &http.Client{
 		Transport:     &http.Transport{TLSClientConfig: tlsConfig},
@@ -906,7 +918,7 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	}
 
 	httpTransport := &http.Transport{
-		TLSClientConfig: tlsConfig,
+		TLSClientConfig: tlsConfigForHost(tlsConfig, host),
 	}
 	httpClient := &http.Client{
 		Transport:     httpTransport,
@@ -1140,7 +1152,7 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	for i, node := range nodes {
 		results[i] = make([]string, len(ports))
 
-		ips, err := net.LookupHost(node.Hostname)
+		ips, err := net.LookupHost(helpers.BareHost(node.Hostname))
 		if err == nil && len(ips) == 0 {
 			err = fmt.Errorf("no addresses found")
 		}
@@ -1686,7 +1698,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				infoSourcePort)
 
 			httpTransport := &http.Transport{
-				TLSClientConfig: tlsConfig,
+				TLSClientConfig: tlsConfigForHost(tlsConfig, infoSourceHost),
 			}
 			httpClient := &http.Client{
 				Transport:     httpTransport,
@@ -1765,7 +1777,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	// One cert covers every service on a node
 	tlsReported := map[string]bool{}
 
-	testHTTPClient := newServiceProbeClient(tlsConfig)
+	var testHTTPClient *http.Client
 
 	testMemdService := func(node clusterNode, svcName, svcKeyPlain, svcKeySSL string) {
 		svcKey := svcKeyPlain
@@ -1956,6 +1968,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	}
 
 	for _, node := range nodesList {
+		testHTTPClient = newServiceProbeClient(tlsConfigForHost(tlsConfig, node.Hostname))
 		testMemdService(node, "Key Value", "kv", "kvSSL")
 		testHTTPService(node, "Management", "mgmt", "mgmtSSL")
 		testHTTPService(node, "Views", "capi", "capiSSL")

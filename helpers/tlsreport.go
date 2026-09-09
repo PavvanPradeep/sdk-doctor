@@ -50,7 +50,7 @@ func BuildTLSChainInfo(state *tls.ConnectionState, dialedHost string, now time.T
 			info.LeafSANs = append(info.LeafSANs, ip.String())
 		}
 
-		info.HostMatches = certificateMatchesHost(leaf, dialedHost)
+		info.HostMatches = certificateMatchesHost(leaf, TLSServerName(dialedHost))
 	}
 
 	return info
