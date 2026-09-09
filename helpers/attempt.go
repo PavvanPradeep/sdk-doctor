@@ -4,6 +4,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"net/netip"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -345,6 +347,36 @@ func (b *AttemptBuilder) withReached(phase Phase) *AttemptBuilder {
 // Reached reports the phase withReached recorded; meaningless before Dial has succeeded
 func (b *AttemptBuilder) Reached() Phase {
 	return b.reached
+}
+
+func BareHost(host string) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+
+	return host
+}
+
+func HostPort(host string, port int) string {
+	return net.JoinHostPort(BareHost(host), strconv.Itoa(port))
+}
+
+func TLSServerName(host string) string {
+	if addr, err := netip.ParseAddr(BareHost(host)); err == nil {
+		return addr.WithZone("").String()
+	}
+
+	return BareHost(host)
+}
+
+func HostIsUsable(host string) bool {
+	bare := BareHost(host)
+
+	if _, err := netip.ParseAddr(bare); err == nil {
+		return true
+	}
+
+	return !strings.ContainsAny(bare, "%\t\n\r ")
 }
 
 func interfaceForIP(address string) string {
