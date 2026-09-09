@@ -4,8 +4,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"net"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +27,7 @@ func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls
 		user = bucket
 	}
 
-	address := net.JoinHostPort(host, strconv.Itoa(port))
+	address := HostPort(host, port)
 	builder := NewAttempt(kind, address, dialBudget)
 
 	deadline := time.Now().Add(dialBudget)
@@ -37,7 +35,7 @@ func Dial(kind, host string, port int, bucket, user, pass string, tlsConfig *tls
 	var srvTLSConfig *tls.Config
 	if tlsConfig != nil {
 		srvTLSConfig = tlsConfig.Clone()
-		srvTLSConfig.ServerName = host
+		srvTLSConfig.ServerName = TLSServerName(host)
 	}
 
 	dialResult, err := memd.DialMemdConn(address, srvTLSConfig, deadline)

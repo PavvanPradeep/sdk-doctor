@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,13 +25,6 @@ import (
 	"github.com/couchbaselabs/sdk-doctor/memd"
 	"github.com/spf13/cobra"
 )
-
-func stripIPv6Address(address string) string {
-	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
-		return address[1 : len(address)-1]
-	}
-	return address
-}
 
 // dur formats a duration for the log, as most connect phases are sub-millisecond
 func dur(d time.Duration) string {
@@ -96,8 +90,8 @@ func probeTLSChain(host string, port int) bool {
 		Timeout: 2000 * time.Millisecond,
 	}
 
-	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, strconv.Itoa(port)),
-		&tls.Config{InsecureSkipVerify: true, ServerName: host})
+	conn, err := tls.DialWithDialer(dialer, "tcp", helpers.HostPort(host, port),
+		&tls.Config{InsecureSkipVerify: true, ServerName: helpers.TLSServerName(host)})
 	if err != nil {
 		return false
 	}
@@ -107,6 +101,30 @@ func probeTLSChain(host string, port int) bool {
 	logTLSChainInfo(host, port, helpers.BuildTLSChainInfo(&state, host, time.Now()))
 
 	return true
+}
+
+func reportBootstrapTLSChain(attempts []helpers.Attempt) {
+	for _, attempt := range attempts {
+		switch helpers.Category(attempt.Category) {
+		case helpers.CategoryTLSVerify, helpers.CategoryTLSHandshake:
+		default:
+			continue
+		}
+
+		host, port, err := net.SplitHostPort(attempt.Endpoint)
+		if err != nil {
+			return
+		}
+
+		portNum, err := strconv.Atoi(port)
+		if err != nil {
+			return
+		}
+
+		probeTLSChain(host, portNum)
+
+		return
+	}
 }
 
 func logConnectPhases(attempt helpers.Attempt, timing memd.ConnectTiming) {
@@ -199,14 +217,14 @@ func (t *httpTrace) Resolved() []string {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	return t.resolved
+	return append([]string(nil), t.resolved...)
 }
 
 func (t *httpTrace) Addresses() []memd.AddressResult {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	return t.addresses
+	return append([]memd.AddressResult(nil), t.addresses...)
 }
 
 func (t *httpTrace) Latency() (time.Duration, bool) {
@@ -432,15 +450,79 @@ func sampleKVLatency(client *helpers.MemdClient, stats *helpers.PingHelper, firs
 	return true
 }
 
-// idleTest idles a connection for idleTestArg then NOOPs it, to catch a stateful firewall
-// or load balancer silently dropping idle connections
-func idleTest(client *helpers.MemdClient) (time.Duration, error) {
-	time.Sleep(idleTestArg)
+type idleTarget struct {
+	host string
+	port int
+}
 
-	start := time.Now()
-	err := client.Ping()
+func runIdleTest(targets []idleTarget, bucket, user, pass string, tlsConfig *tls.Config) {
+	if len(targets) == 0 {
+		return
+	}
 
-	return time.Since(start), err
+	idleFor := idleTestArg
+	gLog.Log("Testing %d connection(s) for connection reaping after %s idle...",
+		len(targets), dur(idleFor))
+
+	results := make([]struct {
+		attempt helpers.Attempt
+		idle    idleTestResult
+	}, len(targets))
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+		go func(i int, target idleTarget) {
+			defer wg.Done()
+			client, builder, err := helpers.Dial("idle-kv", target.host, target.port,
+				bucket, user, pass, tlsConfig)
+			if err != nil {
+				results[i].attempt = builder.FromDial(err)
+				return
+			}
+			defer client.Close()
+			results[i].attempt = builder.Finish(builder.Reached(), "", nil)
+
+			idleStart := time.Now()
+			time.Sleep(idleFor)
+			start := time.Now()
+			err = client.Ping()
+			result := idleTestResult{Host: target.host, Port: target.port, IdleFor: dur(start.Sub(idleStart))}
+			if err != nil {
+				result.Error = err.Error()
+			} else {
+				result.ReplyTime = dur(time.Since(start))
+			}
+			results[i].idle = result
+		}(i, target)
+	}
+	wg.Wait()
+
+	for i, outcome := range results {
+		recordAttempt(outcome.attempt)
+
+		if outcome.attempt.Error != "" {
+			gLog.Warn(
+				"Not idle-testing `%s:%d`, a connection for the test could not be opened even"+
+					" though sampling had just succeeded on it (error: %s)",
+				targets[i].host, targets[i].port, outcome.attempt.Error)
+
+			continue
+		}
+
+		result := outcome.idle
+		if result.Error != "" {
+			gLog.Error(
+				"Connection to `%s:%d` did not survive %s idle (error: %s), which is"+
+					" consistent with a stateful firewall or load balancer dropping idle"+
+					" connections.",
+				result.Host, result.Port, result.IdleFor, result.Error)
+		} else {
+			gLog.Log("Connection to `%s:%d` survived %s idle, NOOP replied in %s",
+				result.Host, result.Port, result.IdleFor, result.ReplyTime)
+		}
+
+		gReport.IdleTest = append(gReport.IdleTest, result)
+	}
 }
 
 var gLog helpers.Logger
@@ -655,7 +737,7 @@ func nodesFromMasterConfig(config terseBucketConfig, networkType string) []clust
 		return nodes
 	}
 
-	endpoint := net.JoinHostPort(config.SourceHost, strconv.Itoa(config.SourcePort))
+	endpoint := helpers.HostPort(config.SourceHost, config.SourcePort)
 
 	// A config listing no nodes at all is a different fault from one missing the chosen network
 	if len(config.NodesExt) == 0 {
@@ -684,6 +766,7 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 	if thisNode == nil {
 		return "default"
 	}
+	sourceHost := helpers.BareHost(config.SourceHost)
 
 	// Check if we connected using any of the ports associated with the default
 	// configurations that are available.
@@ -693,7 +776,7 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 		hostname = config.SourceHost
 	}
 
-	if hostname == config.SourceHost {
+	if helpers.BareHost(hostname) == sourceHost {
 		for _, svcPort := range thisNode.Services {
 			if svcPort == config.SourcePort {
 				return "default"
@@ -717,7 +800,7 @@ func networkFromTerseBucketConfig(config terseBucketConfig) string {
 			altHostname = hostname
 		}
 
-		if altHostname != config.SourceHost {
+		if helpers.BareHost(altHostname) != sourceHost {
 			continue
 		}
 
@@ -756,6 +839,10 @@ var healthPaths = map[string]string{
 	"cbas": "/admin/ping", "fts": "/api/ping",
 }
 
+func probeNeedsCredentials(svcKeyPlain string) bool {
+	return svcKeyPlain == "mgmt"
+}
+
 func verdictForStatus(healthEndpoint bool, status int) httpProbeVerdict {
 	switch {
 	case status >= 500:
@@ -771,14 +858,26 @@ func verdictForStatus(healthEndpoint bool, status int) httpProbeVerdict {
 	}
 }
 
+func tlsConfigForHost(tlsConfig *tls.Config, host string) *tls.Config {
+	if tlsConfig == nil {
+		return nil
+	}
+
+	hostConfig := tlsConfig.Clone()
+	hostConfig.ServerName = helpers.TLSServerName(host)
+	return hostConfig
+}
+
 func newServiceProbeClient(tlsConfig *tls.Config) *http.Client {
 	return &http.Client{
-		Transport: &http.Transport{TLSClientConfig: tlsConfig},
-		Timeout:   serviceProbeBudget,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+		Transport:     &http.Transport{TLSClientConfig: tlsConfig},
+		Timeout:       serviceProbeBudget,
+		CheckRedirect: refuseRedirect,
 	}
+}
+
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 const maxProbeBody = 256
@@ -819,11 +918,12 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 	}
 
 	httpTransport := &http.Transport{
-		TLSClientConfig: tlsConfig,
+		TLSClientConfig: tlsConfigForHost(tlsConfig, host),
 	}
 	httpClient := &http.Client{
-		Transport: httpTransport,
-		Timeout:   httpConfigBudget,
+		Transport:     httpTransport,
+		Timeout:       httpConfigBudget,
+		CheckRedirect: refuseRedirect,
 	}
 
 	scheme := "http"
@@ -831,11 +931,16 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 		scheme = "https"
 	}
 
-	endpoint := net.JoinHostPort(host, strconv.Itoa(port))
+	endpoint := helpers.HostPort(host, port)
 	builder := helpers.NewAttempt("bootstrap-http-terse", endpoint, httpConfigBudget)
 
-	uri := fmt.Sprintf("%s://%s/pools/default/b/%s", scheme, endpoint, bucket)
-	req, _ := http.NewRequest("GET", uri, nil)
+	uri := (&url.URL{Scheme: scheme, Host: endpoint, Path: "/pools/default/b/" + bucket}).String()
+
+	req, err := http.NewRequest("GET", uri, nil)
+	if err != nil {
+		return terseBucketConfig{}, builder.Finish(helpers.PhaseNone, helpers.CategoryUnknown, err), err
+	}
+
 	req.SetBasicAuth(user, pass)
 
 	// The same tracer the HTTP service probe uses, so both paths report the same phases
@@ -992,7 +1097,7 @@ func matrixPorts(nodes []clusterNode, useTLS bool) []portDef {
 }
 
 func probePort(host string, port int, timeout time.Duration) string {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
+	conn, err := net.DialTimeout("tcp", helpers.HostPort(host, port), timeout)
 	if err == nil {
 		conn.Close()
 		return "open"
@@ -1047,7 +1152,7 @@ func scanPortMatrix(nodes []clusterNode, useTLS bool) {
 	for i, node := range nodes {
 		results[i] = make([]string, len(ports))
 
-		ips, err := net.LookupHost(node.Hostname)
+		ips, err := net.LookupHost(helpers.BareHost(node.Hostname))
 		if err == nil && len(ips) == 0 {
 			err = fmt.Errorf("no addresses found")
 		}
@@ -1357,7 +1462,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	}
 
 	for _, target := range dnsHosts {
-		strippedHost := stripIPv6Address(target.Host)
+		strippedHost := helpers.BareHost(target.Host)
 
 		gLog.Log("Performing DNS lookup for host `%s`", strippedHost)
 
@@ -1515,6 +1620,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			gLog.NewLine()
 		}
 
+		reportBootstrapTLSChain(gReport.Attempts)
+
 		gLog.Error("%s", bootstrapSummary(gReport.Attempts, resConnSpec.Bucket))
 
 		return
@@ -1591,19 +1698,29 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				infoSourcePort)
 
 			httpTransport := &http.Transport{
-				TLSClientConfig: tlsConfig,
+				TLSClientConfig: tlsConfigForHost(tlsConfig, infoSourceHost),
 			}
 			httpClient := &http.Client{
-				Transport: httpTransport,
-				Timeout:   2000 * time.Millisecond,
+				Transport:     httpTransport,
+				Timeout:       2000 * time.Millisecond,
+				CheckRedirect: refuseRedirect,
 			}
 
-			uri := fmt.Sprintf("%s://%s/pools/default", infoSourceScheme,
-				net.JoinHostPort(infoSourceHost, strconv.Itoa(infoSourcePort)))
-			req, _ := http.NewRequest("GET", uri, nil)
-			req.SetBasicAuth(username, password)
+			uri := (&url.URL{
+				Scheme: infoSourceScheme,
+				Host:   helpers.HostPort(infoSourceHost, infoSourcePort),
+				Path:   "/pools/default",
+			}).String()
 
-			resp, err := httpClient.Do(req)
+			var resp *http.Response
+
+			req, err := http.NewRequest("GET", uri, nil)
+			if err == nil {
+				req.SetBasicAuth(username, password)
+
+				resp, err = httpClient.Do(req)
+			}
+
 			if err != nil {
 				gLog.Log("Failed to retreive cluster information (error: %s)", err.Error())
 			} else if resp.StatusCode != 200 {
@@ -1655,12 +1772,12 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	//======================================================================
 	//  SERVICES
 	//======================================================================
-	var svcOk, svcFailed, svcUnreachable, svcRefused, svcStatus int
+	var svcOk, svcFailed, svcUnreachable, svcRefused, svcStatus, svcMalformed int
 
 	// One cert covers every service on a node
 	tlsReported := map[string]bool{}
 
-	testHTTPClient := newServiceProbeClient(tlsConfig)
+	var testHTTPClient *http.Client
 
 	testMemdService := func(node clusterNode, svcName, svcKeyPlain, svcKeySSL string) {
 		svcKey := svcKeyPlain
@@ -1718,17 +1835,44 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			path, healthEndpoint = "/", false
 		}
 
-		endpoint := net.JoinHostPort(node.Hostname, strconv.Itoa(svcPort))
-		uri := fmt.Sprintf("%s://%s%s", svcScheme, endpoint, path)
-		req, _ := http.NewRequest("GET", uri, nil)
+		endpoint := helpers.HostPort(node.Hostname, svcPort)
 
-		if username != "" {
+		builder := helpers.NewAttempt("service-"+svcKeyPlain, endpoint, serviceProbeBudget)
+
+		if !helpers.HostIsUsable(node.Hostname) {
+			err := fmt.Errorf("advertised hostname `%s` is not a usable host or IP literal", node.Hostname)
+
+			recordAttempt(builder.Finish(helpers.PhaseNone, helpers.CategoryUnknown, err))
+
+			svcFailed++
+			svcMalformed++
+
+			gLog.Error("Cannot probe %s service at `%s`, the cluster advertises an address"+
+				" that cannot be used in a URL (error: %s)", svcName, endpoint, err)
+
+			return
+		}
+
+		uri := (&url.URL{Scheme: svcScheme, Host: endpoint, Path: path}).String()
+
+		req, err := http.NewRequest("GET", uri, nil)
+		if err != nil {
+			recordAttempt(builder.Finish(helpers.PhaseNone, helpers.CategoryUnknown, err))
+
+			svcFailed++
+			svcMalformed++
+
+			gLog.Error("Cannot probe %s service at `%s`, the cluster advertises an address"+
+				" that cannot be used in a URL (error: %s)", svcName, endpoint, err)
+
+			return
+		}
+
+		if probeNeedsCredentials(svcKeyPlain) && username != "" {
 			req.SetBasicAuth(username, password)
 		}
 
 		req, trace := traceRequest(req)
-
-		builder := helpers.NewAttempt("service-"+svcKeyPlain, endpoint, serviceProbeBudget)
 
 		resp, err := testHTTPClient.Do(req)
 		if err != nil {
@@ -1824,6 +1968,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	}
 
 	for _, node := range nodesList {
+		testHTTPClient = newServiceProbeClient(tlsConfigForHost(tlsConfig, node.Hostname))
 		testMemdService(node, "Key Value", "kv", "kvSSL")
 		testHTTPService(node, "Management", "mgmt", "mgmtSSL")
 		testHTTPService(node, "Views", "capi", "capiSSL")
@@ -1860,7 +2005,16 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				" the handshake are both fine, so the fault is in the services themselves or in"+
 				" the credentials' access to them.  The per-service errors above name the status.",
 			svcFailed)
-	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 && svcRefused == 0 && svcStatus == 0 {
+	} else if svcOk == 0 && svcFailed > 0 && svcMalformed == svcFailed {
+		gLog.Error(
+			"Bootstrap succeeded but none of the %d advertised service endpoints could be"+
+				" probed, because the addresses the cluster advertises on the `%s` network"+
+				" cannot be used in a URL.  The per-endpoint errors above name each one.  This"+
+				" is a cluster configuration fault rather than a network one: fix the node"+
+				" hostnames, or the alternate addresses, that the cluster hands to clients.",
+			svcFailed, selectedNetwork)
+	} else if svcOk == 0 && svcFailed > 0 && svcUnreachable == 0 && svcRefused == 0 &&
+		svcStatus == 0 && svcMalformed == 0 {
 		checks := "that the credentials are valid"
 		if tlsConfig != nil {
 			checks = fmt.Sprintf("that the certificate authority you passed signs the cluster's"+
@@ -1880,6 +2034,8 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	//======================================================================
 	//  CONNECTION PERFORMANCE
 	//======================================================================
+	var idlers []idleTarget
+
 	for _, node := range nodesList {
 		kvPort := node.Services["kv"]
 		if tlsConfig != nil {
@@ -2017,30 +2173,12 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			}
 
 			if idleTestArg > 0 && sampleSurvived {
-				gLog.Log("Idling `%s:%d` for %s to test for connection reaping...",
-					node.Hostname, kvPort, dur(idleTestArg))
-
-				replyTime, err := idleTest(client)
-
-				result := idleTestResult{Host: node.Hostname, Port: kvPort, IdleFor: dur(idleTestArg)}
-
-				if err != nil {
-					result.Error = err.Error()
-					gLog.Error(
-						"Connection to `%s:%d` did not survive %s idle (error: %s), which is"+
-							" consistent with a stateful firewall or load balancer dropping idle"+
-							" connections.",
-						node.Hostname, kvPort, dur(idleTestArg), err)
-				} else {
-					result.ReplyTime = dur(replyTime)
-					gLog.Log("Connection to `%s:%d` survived %s idle, NOOP replied in %s",
-						node.Hostname, kvPort, dur(idleTestArg), dur(replyTime))
-				}
-
-				gReport.IdleTest = append(gReport.IdleTest, result)
+				idlers = append(idlers, idleTarget{node.Hostname, kvPort})
 			}
 
 			client.Close()
 		}
 	}
+
+	runIdleTest(idlers, resConnSpec.Bucket, username, password, tlsConfig)
 }
