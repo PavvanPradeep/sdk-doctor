@@ -83,6 +83,7 @@ type DialResult struct {
 	Conn      ReadWriteCloser
 	Timing    ConnectTiming
 	TLSState  *tls.ConnectionState
+	Resolved  []string
 	Addresses []AddressResult
 }
 
@@ -97,6 +98,7 @@ type AddressResult struct {
 // DialError carries what the dial had learned when it failed
 type DialError struct {
 	Timing    ConnectTiming
+	Resolved  []string
 	Addresses []AddressResult
 	Err       error
 }
@@ -136,11 +138,12 @@ func attemptDeadline(deadline, now time.Time, remainingAddrs int) time.Time {
 // DialMemdConn dials a memcached connection
 func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*DialResult, error) {
 	var timing ConnectTiming
+	var resolved []string
 	var addresses []AddressResult
 
 	// Every failure returns a nil result, exactly as before, with the diagnostics on the error
 	fail := func(err error) (*DialResult, error) {
-		return nil, &DialError{Timing: timing, Addresses: addresses, Err: err}
+		return nil, &DialError{Timing: timing, Resolved: resolved, Addresses: addresses, Err: err}
 	}
 
 	host, port, err := net.SplitHostPort(address)
@@ -168,6 +171,8 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		if len(ips) == 0 {
 			return fail(fmt.Errorf("no addresses found for host `%s`", host))
 		}
+
+		resolved = ips
 	}
 
 	// Every address is tried, and every outcome kept, so a multi-homed host loses no errors
@@ -240,6 +245,7 @@ func DialMemdConn(address string, tlsConfig *tls.Config, deadline time.Time) (*D
 		},
 		Timing:    timing,
 		TLSState:  tlsState,
+		Resolved:  resolved,
 		Addresses: addresses,
 	}, nil
 }

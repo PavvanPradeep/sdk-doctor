@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +47,7 @@ const (
 	// CategoryConfigUnavailable is no configuration at all, as against one that came back empty
 	CategoryConfigUnavailable Category = "config_unavailable"
 	CategoryServerError       Category = "server_error"
+	CategoryHTTPStatus        Category = "http_status"
 	CategoryUnknown           Category = "unknown"
 )
 
@@ -57,25 +59,38 @@ func AllCategories() []Category {
 		CategoryTLSHandshake, CategoryTLSVerify, CategoryResponseTimeout,
 		CategoryAuthRejected, CategoryBucketNotFound, CategoryBucketForbidden,
 		CategoryCCCPUnsupported, CategoryConfigUnavailable, CategoryConfigInvalid, CategoryConfigEmpty,
-		CategoryServerError, CategoryUnknown,
+		CategoryServerError, CategoryHTTPStatus, CategoryUnknown,
 	}
 }
 
 // AddressAttempt records one address a connection attempt tried
 type AddressAttempt struct {
-	Address  string
-	Family   string // "ipv4" | "ipv6"
-	Local    string `json:",omitempty"`
-	Phase    string
-	Category string `json:",omitempty"`
-	Elapsed  string
-	Error    string `json:",omitempty"`
+	Address   string
+	Family    string // "ipv4" | "ipv6"
+	Local     string `json:",omitempty"`
+	Interface string `json:",omitempty"`
+	Phase     string
+	Category  string `json:",omitempty"`
+	Elapsed   string
+	Error     string `json:",omitempty"`
+}
+
+// HTTPProbe records the HTTP portion of a connection attempt
+type HTTPProbe struct {
+	Path           string
+	HealthEndpoint bool   `json:",omitempty"`
+	Status         int    `json:",omitempty"`
+	Server         string `json:",omitempty"`
+	Redirect       string `json:",omitempty"`
+	Latency        string `json:",omitempty"`
+	Body           string `json:",omitempty"`
 }
 
 // Attempt records one connection attempt against one endpoint, bootstrap or service
 type Attempt struct {
 	Kind      string
 	Endpoint  string
+	Resolved  []string         `json:",omitempty"`
 	Addresses []AddressAttempt `json:",omitempty"`
 	Phase     string
 	Category  string `json:",omitempty"`
@@ -87,6 +102,8 @@ type Attempt struct {
 	TCP  string `json:",omitempty"`
 	TLS  string `json:",omitempty"`
 	SASL string `json:",omitempty"`
+
+	HTTP *HTTPProbe `json:",omitempty"`
 }
 
 // Dur formats a duration the way every other field in the report is formatted
@@ -195,6 +212,18 @@ func CategoryForHTTPStatus(code int) Category {
 	}
 }
 
+// CategoryForServiceHTTPStatus maps a service response without bucket-specific labels
+func CategoryForServiceHTTPStatus(code int) Category {
+	switch {
+	case code == 401:
+		return CategoryAuthRejected
+	case code >= 500:
+		return CategoryServerError
+	default:
+		return CategoryHTTPStatus
+	}
+}
+
 // phaseOfDial reports the phase a failed dial died in, from the diagnostics it carried
 func phaseOfDial(dialErr *memd.DialError) Phase {
 	switch {
@@ -273,7 +302,9 @@ type AttemptBuilder struct {
 	timing memd.ConnectTiming
 	sasl   time.Duration
 
+	resolved  []string
 	addresses []AddressAttempt
+	http      *HTTPProbe
 
 	reached Phase
 }
@@ -316,10 +347,47 @@ func (b *AttemptBuilder) Reached() Phase {
 	return b.reached
 }
 
+func interfaceForIP(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	if zone := strings.LastIndexByte(host, '%'); zone >= 0 {
+		return host[zone+1:]
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return ""
+	}
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var candidate net.IP
+			switch typed := addr.(type) {
+			case *net.IPNet:
+				candidate = typed.IP
+			case *net.IPAddr:
+				candidate = typed.IP
+			}
+			if candidate != nil && candidate.Equal(ip) {
+				return iface.Name
+			}
+		}
+	}
+
+	return ""
+}
+
 func addressFamily(address string) string {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
+	}
+	if zone := strings.LastIndexByte(host, '%'); zone >= 0 {
+		host = host[:zone]
 	}
 
 	ip := net.ParseIP(host)
@@ -333,8 +401,19 @@ func addressFamily(address string) string {
 	}
 }
 
-// withAddresses converts memd's raw per-address results into report records
-func (b *AttemptBuilder) withAddresses(results []memd.AddressResult, phase Phase) *AttemptBuilder {
+func (b *AttemptBuilder) WithResolved(addresses []string) *AttemptBuilder {
+	b.resolved = addresses
+
+	return b
+}
+
+func (b *AttemptBuilder) WithHTTP(probe HTTPProbe) *AttemptBuilder {
+	b.http = &probe
+
+	return b
+}
+
+func (b *AttemptBuilder) WithAddresses(results []memd.AddressResult, phase Phase) *AttemptBuilder {
 	for _, result := range results {
 		record := AddressAttempt{
 			Address: result.Address,
@@ -342,6 +421,9 @@ func (b *AttemptBuilder) withAddresses(results []memd.AddressResult, phase Phase
 			Local:   result.Local,
 			Elapsed: Dur(result.Done.Sub(result.Start)),
 			Phase:   string(PhaseTCP),
+		}
+		if result.Local != "" {
+			record.Interface = interfaceForIP(result.Local)
 		}
 
 		if result.Err != nil {
@@ -363,7 +445,9 @@ func (b *AttemptBuilder) FromDial(err error) Attempt {
 	var dialErr *memd.DialError
 	if errors.As(err, &dialErr) {
 		phase := phaseOfDial(dialErr)
-		b.WithTiming(dialErr.Timing, 0).withAddresses(dialErr.Addresses, phase)
+		b.WithTiming(dialErr.Timing, 0).
+			WithResolved(dialErr.Resolved).
+			WithAddresses(dialErr.Addresses, phase)
 
 		return b.Finish(phase, Classify(phase, err), err)
 	}
@@ -382,7 +466,9 @@ func (b *AttemptBuilder) Finish(phase Phase, category Category, err error) Attem
 	attempt := Attempt{
 		Kind:      b.kind,
 		Endpoint:  b.endpoint,
+		Resolved:  b.resolved,
 		Addresses: b.addresses,
+		HTTP:      b.http,
 		Phase:     string(phase),
 		Category:  string(category),
 		Elapsed:   Dur(time.Since(b.start)),

@@ -40,6 +40,7 @@ func TestEveryCategoryIsReachableFromRealCode(t *testing.T) {
 	record("http 418", fetchAgainst(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 	}))
+	produced[helpers.CategoryForServiceHTTPStatus(http.StatusForbidden)] = "service http 403"
 	record("unparseable config", fetchAgainst(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("this is not json"))
 	}))
