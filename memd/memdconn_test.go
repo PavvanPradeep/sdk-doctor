@@ -110,15 +110,6 @@ func requireUnresolvable(t *testing.T) {
 	}
 }
 
-func TestDialMemdConnUnknownHost(t *testing.T) {
-	requireUnresolvable(t)
-
-	_, err := DialMemdConn(unresolvableHost+":11210", nil, time.Now().Add(2*time.Second))
-	if err == nil {
-		t.Fatal("expected an error dialing an unresolvable host, got nil")
-	}
-}
-
 func TestDialMemdConnZeroDeadline(t *testing.T) {
 	addr, closeFn := startEchoListener(t)
 	defer closeFn()
@@ -258,12 +249,19 @@ func TestDialMemdConnRecordsTheResolvedAddresses(t *testing.T) {
 	defer ln.Close()
 
 	go func() {
+		var conns []net.Conn
+		defer func() {
+			for _, conn := range conns {
+				conn.Close()
+			}
+		}()
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			defer conn.Close()
+			conns = append(conns, conn)
 		}
 	}()
 

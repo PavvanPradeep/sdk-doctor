@@ -41,4 +41,7 @@ func TestLogEntries(t *testing.T) {
 	if strings.Contains(out.String(), "informative") {
 		t.Fatalf("expected the summary to omit info lines, got %s", out.String())
 	}
+	if !strings.Contains(out.String(), "Found 1 warning, 1 error, see listing above.") {
+		t.Fatalf("expected exact singular counts, got %s", out.String())
+	}
 }

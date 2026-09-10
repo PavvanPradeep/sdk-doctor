@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,7 +17,7 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 	defer saveGlobals()()
 
 	gLog = helpers.Logger{}
-	gLog.SetOutput(ioutil.Discard)
+	gLog.SetOutput(io.Discard)
 	gReport = diagnosticReport{ConnectionString: "couchbases://node1"}
 
 	base := time.Now()
@@ -33,13 +34,14 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 		Finish(helpers.PhaseSelectBucket, "", nil), timing)
 
 	gLog.Warn("something looks off")
+	gLog.Error("something broke")
 
 	path := filepath.Join(t.TempDir(), "report.json")
 	if err := writeReport(path); err != nil {
 		t.Fatalf("failed to write report: %s", err)
 	}
 
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read report: %s", err)
 	}
@@ -81,6 +83,9 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 	}
 	if !warned {
 		t.Fatalf("expected the warning in the report log, got %+v", got.Log)
+	}
+	if got.Summary != (reportSummary{Warnings: 1, Errors: 1, Worst: "ERRO"}) {
+		t.Fatalf("unexpected report summary: %+v", got.Summary)
 	}
 }
 
@@ -136,7 +141,7 @@ func TestLogConnectPhasesPreservesTheAttemptKindVerbatim(t *testing.T) {
 	defer saveGlobals()()
 
 	gLog = helpers.Logger{}
-	gLog.SetOutput(ioutil.Discard)
+	gLog.SetOutput(io.Discard)
 	gReport = diagnosticReport{}
 
 	timing := memd.ConnectTiming{

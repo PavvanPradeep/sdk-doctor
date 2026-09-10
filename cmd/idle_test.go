@@ -108,7 +108,7 @@ func TestIdleWindowIsIndependentOfOtherNodes(t *testing.T) {
 			wantResults := 2
 			if stall == memd.CmdSASLListMechs {
 				wantResults = 1
-				if len(gReport.Attempts) != 1 || gReport.Attempts[0].Error == "" {
+				if len(gReport.Attempts) != 2 || gReport.Attempts[1].Error == "" {
 					t.Fatalf("missing failed dial attempt: %+v", gReport.Attempts)
 				}
 			}

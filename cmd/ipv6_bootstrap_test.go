@@ -102,6 +102,7 @@ func TestFetchTerseConfigDoesNotFollowARedirectWithCredentials(t *testing.T) {
 	}
 }
 
+// Credentials must not reach a non-mgmt service, and nothing else pins that
 func TestOnlyTheManagementProbeSendsCredentials(t *testing.T) {
 	for _, svc := range []string{"mgmt", "capi", "n1ql", "fts", "cbas"} {
 		want := svc == "mgmt"

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -25,6 +26,13 @@ type Logger struct {
 // timeFormat is RFC3339 with milliseconds, so lines correlate against cluster logs
 const timeFormat = "2006-01-02T15:04:05.000Z07:00"
 
+// Levels as they appear in a log line and in LogEntry.Level
+const (
+	LevelInfo  = "INFO"
+	LevelWarn  = "WARN"
+	LevelError = "ERRO"
+)
+
 // SetOutput redirects the log, which writes to stdout by default
 func (l *Logger) SetOutput(w io.Writer) {
 	l.out = w
@@ -42,9 +50,7 @@ func (l *Logger) Entries() []LogEntry {
 	return l.entries
 }
 
-// Writer returns the log's destination, so callers printing raw blocks stay in step
-//
-//	with the log and remain redirectable in tests
+// Writer exposes the log's destination for callers that print raw blocks outside Log/Warn/Error
 func (l *Logger) Writer() io.Writer {
 	return l.writer()
 }
@@ -67,17 +73,17 @@ func (l *Logger) write(level, format string, args ...interface{}) {
 
 // Log writes to the log at INFO level
 func (l *Logger) Log(format string, args ...interface{}) {
-	l.write("INFO", format, args...)
+	l.write(LevelInfo, format, args...)
 }
 
 // Warn writes to the log at WARN level
 func (l *Logger) Warn(format string, args ...interface{}) {
-	l.write("WARN", format, args...)
+	l.write(LevelWarn, format, args...)
 }
 
 // Error writes to the log at ERROR level
 func (l *Logger) Error(format string, args ...interface{}) {
-	l.write("ERRO", format, args...)
+	l.write(LevelError, format, args...)
 }
 
 func (l Logger) linesAt(level string) []string {
@@ -97,20 +103,42 @@ func (l Logger) PrintSummary() {
 
 	fmt.Fprintf(out, "Summary:\n")
 
-	warns := l.linesAt("WARN")
-	errors := l.linesAt("ERRO")
+	warns := l.linesAt(LevelWarn)
+	errors := l.linesAt(LevelError)
 
 	for _, line := range warns {
-		fmt.Fprintf(out, "%s %s\n", color.YellowString("[WARN]"), line)
+		fmt.Fprintf(out, "%s %s\n", color.YellowString("["+LevelWarn+"]"), line)
 	}
 	for _, line := range errors {
-		fmt.Fprintf(out, "%s %s\n", color.RedString("[ERRO]"), line)
+		fmt.Fprintf(out, "%s %s\n", color.RedString("["+LevelError+"]"), line)
 	}
 
-	fmt.Fprintf(out, "\n")
-	if len(warns) > 0 || len(errors) > 0 {
-		fmt.Fprintf(out, "Found multiple issues, see listing above.\n")
-	} else {
-		fmt.Fprintf(out, "Nothing of importance to note!  Nice job!\n")
+	fmt.Fprintf(out, "\n%s\n", closingLine(len(warns), len(errors)))
+}
+
+func closingLine(warns, errors int) string {
+	if warns == 0 && errors == 0 {
+		return "Nothing of importance to note!  Nice job!"
 	}
+
+	var parts []string
+	if warns > 0 {
+		parts = append(parts, pluralCount(warns, "warning"))
+	}
+	if errors > 0 {
+		parts = append(parts, pluralCount(errors, "error"))
+	}
+
+	line := fmt.Sprintf("Found %s, see listing above.", strings.Join(parts, ", "))
+	if errors > 0 {
+		return color.RedString(line)
+	}
+	return color.YellowString(line)
+}
+
+func pluralCount(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

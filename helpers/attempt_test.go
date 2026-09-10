@@ -140,16 +140,22 @@ func TestIsConnRefused(t *testing.T) {
 	}
 }
 
+// A TLS-phase failure is a handshake problem unless it's specifically a certificate problem
 func TestClassifyDistinguishesHandshakeFromVerification(t *testing.T) {
-	// A TLS-phase failure that is not a certificate problem is a handshake problem
-	generic := &net.OpError{Op: "remote error", Err: errTestHandshake{}}
-
-	if got := Classify(PhaseTLS, generic); got != CategoryTLSHandshake {
-		t.Errorf("expected a handshake category for a non-x509 TLS error, got %q", got)
+	tests := []struct {
+		name string
+		err  error
+		want Category
+	}{
+		{"wrapped generic error", &net.OpError{Op: "remote error", Err: errTestHandshake{}}, CategoryTLSHandshake},
+		{"record header error", tls.RecordHeaderError{Msg: "not a handshake"}, CategoryTLSHandshake},
+		{"unknown authority", x509.UnknownAuthorityError{}, CategoryTLSVerify},
 	}
 
-	if got := Classify(PhaseTLS, x509.UnknownAuthorityError{}); got != CategoryTLSVerify {
-		t.Errorf("expected a verification category for an x509 error, got %q", got)
+	for _, test := range tests {
+		if got := Classify(PhaseTLS, test.err); got != test.want {
+			t.Errorf("%s: Classify(tls, %v) = %q, want %q", test.name, test.err, got, test.want)
+		}
 	}
 }
 
@@ -165,8 +171,7 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 	}{
 		{PhaseNone, CategoryTCPTimeout},
 		{PhaseTCP, CategoryTCPTimeout},
-		// TLS runs on an established connection, so a stall there is the peer going quiet,
-		// not a handshake the two ends could not agree on
+		// TLS runs on an established connection, so a stall is the peer going quiet
 		{PhaseTLS, CategoryResponseTimeout},
 		{PhaseSASL, CategoryResponseTimeout},
 		{PhaseSelectBucket, CategoryResponseTimeout},
@@ -178,17 +183,6 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 		if got := Classify(test.phase, errTestTimeout{}); got != test.want {
 			t.Errorf("Classify(%q, timeout) = %q, want %q", test.phase, got, test.want)
 		}
-	}
-}
-
-// A TLS error that is not a timeout must still be named by the handshake/trust split
-func TestClassifyKeepsTheTLSSplitForNonTimeoutErrors(t *testing.T) {
-	if got := Classify(PhaseTLS, tls.RecordHeaderError{Msg: "not a handshake"}); got != CategoryTLSHandshake {
-		t.Errorf("Classify(tls, record header) = %q, want %q", got, CategoryTLSHandshake)
-	}
-
-	if got := Classify(PhaseTLS, x509.UnknownAuthorityError{}); got != CategoryTLSVerify {
-		t.Errorf("Classify(tls, unknown authority) = %q, want %q", got, CategoryTLSVerify)
 	}
 }
 
@@ -208,9 +202,7 @@ func TestCategoryForConfigStatusKeepsMeaningfulStatuses(t *testing.T) {
 		{memd.StatusNotSupported, CategoryCCCPUnsupported},
 		{memd.StatusAccessError, CategoryBucketForbidden},
 		{memd.StatusAuthError, CategoryAuthRejected},
-		// select_bucket has already succeeded for this bucket by the time a config is fetched,
-		// so KEY_ENOENT here cannot mean the bucket is missing: no configuration came back at
-		// all, which is a different fault from one that came back describing no nodes
+		// bucket is already selected here, so KEY_ENOENT means no config came back, not a missing bucket
 		{memd.StatusKeyNotFound, CategoryConfigUnavailable},
 	}
 
@@ -321,8 +313,7 @@ func TestCategoryForMemdStatusStillReadsKeyNotFoundAsAMissingBucket(t *testing.T
 	}
 }
 
-// A CCCP attempt is sealed only after GetConfig, which applies its own timeout once the dial
-// deadline is cleared.  Reporting just the dial budget made Elapsed look like an overrun.
+// GetConfig adds its own timeout after the dial deadline clears, so the budget must grow
 func TestAttemptBuilderAddBudgetExtendsTheReportedTimeout(t *testing.T) {
 	builder := NewAttempt("bootstrap-cccp", "node1:11210", 2000*time.Millisecond)
 
