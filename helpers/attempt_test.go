@@ -171,8 +171,7 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 	}{
 		{PhaseNone, CategoryTCPTimeout},
 		{PhaseTCP, CategoryTCPTimeout},
-		// TLS runs on an established connection, so a stall there is the peer going quiet,
-		// not a handshake the two ends could not agree on
+		// TLS runs on an established connection, so a stall is the peer going quiet
 		{PhaseTLS, CategoryResponseTimeout},
 		{PhaseSASL, CategoryResponseTimeout},
 		{PhaseSelectBucket, CategoryResponseTimeout},
@@ -314,8 +313,7 @@ func TestCategoryForMemdStatusStillReadsKeyNotFoundAsAMissingBucket(t *testing.T
 	}
 }
 
-// A CCCP attempt is sealed only after GetConfig, which applies its own timeout once the dial
-// deadline is cleared.  Reporting just the dial budget made Elapsed look like an overrun.
+// GetConfig adds its own timeout after the dial deadline clears, so the budget must grow
 func TestAttemptBuilderAddBudgetExtendsTheReportedTimeout(t *testing.T) {
 	builder := NewAttempt("bootstrap-cccp", "node1:11210", 2000*time.Millisecond)
 

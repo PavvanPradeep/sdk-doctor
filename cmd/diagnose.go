@@ -888,12 +888,13 @@ func boundedBody(body io.Reader) string {
 	return strings.ToValidUTF8(strings.Join(strings.Fields(string(data)), " "), "")
 }
 
-func clause(format, value string) string {
+// clause wraps a value in fixed text, or yields nothing when the value is absent
+func clause(prefix, value, suffix string) string {
 	if value == "" {
 		return ""
 	}
 
-	return fmt.Sprintf(format, value)
+	return prefix + value + suffix
 }
 
 func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, helpers.Attempt, error) {
@@ -1918,7 +1919,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			gLog.Error(
 				"%s service at `%s:%d` answered `%s` with HTTP %d%s.  The endpoint was reached,"+
 					" so this is the service's own answer rather than a network fault.",
-				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" (response: %s)", probe.Body))
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" (response: ", probe.Body, ")"))
 
 			return
 		}
@@ -1935,17 +1936,17 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				"Successfully connected to %s service at `%s:%d` (HTTP %d%s).  No documented"+
 					" health endpoint exists for this service, so its reachability was tested"+
 					" but its application health was not.",
-				svcName, node.Hostname, svcPort, resp.StatusCode, clause(" in %s", probe.Latency))
+				svcName, node.Hostname, svcPort, resp.StatusCode, clause(" in ", probe.Latency, ""))
 		case probeHealthUntested:
 			gLog.Warn(
 				"%s service at `%s:%d` answered `%s` with HTTP %d%s rather than serving the"+
 					" documented health endpoint.  The service was reached, but its application"+
 					" health was not tested; an older server version or a proxy in front of the"+
 					" port would both produce this.",
-				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" redirecting to `%s`", probe.Redirect))
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" redirecting to `", probe.Redirect, "`"))
 		default:
 			gLog.Log("%s service at `%s:%d` reported healthy on `%s` (HTTP %d%s)",
-				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" in %s", probe.Latency))
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" in ", probe.Latency, ""))
 		}
 	}
 

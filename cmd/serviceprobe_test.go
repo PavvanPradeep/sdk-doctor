@@ -33,6 +33,7 @@ func TestVerdictForStatus(t *testing.T) {
 	}
 }
 
+// A wrong path silently stops probing health, and no other test would notice
 func TestHealthPathsCoverEveryServiceWithADocumentedEndpoint(t *testing.T) {
 	want := map[string]string{
 		"mgmt": "/pools",

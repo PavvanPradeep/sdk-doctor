@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,7 +17,7 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 	defer saveGlobals()()
 
 	gLog = helpers.Logger{}
-	gLog.SetOutput(ioutil.Discard)
+	gLog.SetOutput(io.Discard)
 	gReport = diagnosticReport{ConnectionString: "couchbases://node1"}
 
 	base := time.Now()
@@ -40,7 +41,7 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 		t.Fatalf("failed to write report: %s", err)
 	}
 
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read report: %s", err)
 	}
@@ -140,7 +141,7 @@ func TestLogConnectPhasesPreservesTheAttemptKindVerbatim(t *testing.T) {
 	defer saveGlobals()()
 
 	gLog = helpers.Logger{}
-	gLog.SetOutput(ioutil.Discard)
+	gLog.SetOutput(io.Discard)
 	gReport = diagnosticReport{}
 
 	timing := memd.ConnectTiming{

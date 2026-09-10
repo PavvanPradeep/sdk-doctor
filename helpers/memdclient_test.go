@@ -317,8 +317,7 @@ func TestDialRecordsAFailedConnectAsAnAttempt(t *testing.T) {
 	}
 }
 
-// A SASL failure is an authentication failure whatever status carries it.  Routing it through
-// CategoryForMemdStatus, a select-bucket mapper, reported EACCESS/KEY_ENOENT as bucket problems.
+// A SASL failure is an auth failure whatever status carries it
 func TestDialReportsEverySASLStatusAsAnAuthFailure(t *testing.T) {
 	for _, status := range []memd.StatusCode{
 		memd.StatusAuthError,

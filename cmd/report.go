@@ -93,16 +93,16 @@ func summarizeLog(entries []helpers.LogEntry) reportSummary {
 
 	for _, entry := range entries {
 		switch entry.Level {
-		case "WARN":
+		case helpers.LevelWarn:
 			s.Warnings++
-		case "ERRO":
+		case helpers.LevelError:
 			s.Errors++
 		}
 	}
 	if s.Errors > 0 {
-		s.Worst = "ERRO"
+		s.Worst = helpers.LevelError
 	} else if s.Warnings > 0 {
-		s.Worst = "WARN"
+		s.Worst = helpers.LevelWarn
 	}
 
 	return s

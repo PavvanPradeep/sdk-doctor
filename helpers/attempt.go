@@ -326,8 +326,7 @@ func (b *AttemptBuilder) WithTiming(timing memd.ConnectTiming, sasl time.Duratio
 	return b
 }
 
-// AddBudget widens the timeout this attempt reports, for an operation that carries its own
-// deadline after the dial's has been cleared
+// AddBudget widens the reported timeout for an operation carrying its own deadline
 func (b *AttemptBuilder) AddBudget(d time.Duration) *AttemptBuilder {
 	b.timeout += d
 

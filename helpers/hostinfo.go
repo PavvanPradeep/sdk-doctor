@@ -10,8 +10,7 @@ import (
 	"strings"
 )
 
-// schemePattern matches a scheme only at the very start of the value, so a scheme-less
-// value containing "://" later on (e.g. in a path or query) is not mistaken for having one
+// schemePattern anchors at the start, so a later "://" is not read as a scheme
 var schemePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://`)
 
 type NetInterface struct {

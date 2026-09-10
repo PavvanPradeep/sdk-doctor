@@ -249,12 +249,19 @@ func TestDialMemdConnRecordsTheResolvedAddresses(t *testing.T) {
 	defer ln.Close()
 
 	go func() {
+		var conns []net.Conn
+		defer func() {
+			for _, conn := range conns {
+				conn.Close()
+			}
+		}()
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			defer conn.Close()
+			conns = append(conns, conn)
 		}
 	}()
 

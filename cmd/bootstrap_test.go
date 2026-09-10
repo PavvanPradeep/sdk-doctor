@@ -164,24 +164,6 @@ func TestBootstrapSummaryScopesTheReachableClauseToItsOwnEndpoints(t *testing.T)
 	}
 }
 
-func TestBootstrapSummaryRanksAuthAboveAnUnreachableNode(t *testing.T) {
-	attempts := []helpers.Attempt{
-		attempt("bootstrap-cccp", "node1:11210", helpers.PhaseTCP, helpers.CategoryTCPTimeout),
-		attempt("bootstrap-cccp", "node2:11210", helpers.PhaseSASL, helpers.CategoryAuthRejected),
-	}
-
-	got := bootstrapSummary(attempts, "travel")
-
-	if !strings.Contains(got, "Authentication was rejected by 1 of 2 endpoints") {
-		t.Errorf("expected the auth rejection to lead, got:\n%s", got)
-	}
-
-	// Nothing is hidden: the secondary cause is named too
-	if !strings.Contains(got, "tcp_timeout") {
-		t.Errorf("expected the secondary category to be named, got:\n%s", got)
-	}
-}
-
 // An unranked category once counted the same attempt as both "answered" and "further"
 func TestBootstrapSummaryCountsAnUnrankedCategoryOnceOnly(t *testing.T) {
 	attempts := []helpers.Attempt{
@@ -383,9 +365,7 @@ func saveGlobals() func() {
 	}
 }
 
-// The rank order is the whole mechanism for leading with the most actionable cause, so it is
-// pinned literally here: deriving the expectation from categoryRank itself would pass under any
-// reordering of it, which is precisely the regression this guards.
+// Pinned literally: deriving the want from categoryRank would pass under any reordering
 func TestCategoryRankOrdersTheMostActionableCauseFirst(t *testing.T) {
 	want := []helpers.Category{
 		helpers.CategoryAuthRejected,
@@ -411,16 +391,9 @@ func TestCategoryRankOrdersTheMostActionableCauseFirst(t *testing.T) {
 			t.Errorf("categoryRank[%d] = %q, want %q", i, categoryRank[i], want[i])
 		}
 	}
-
-	// Unknown must stay last, or it outranks every cause the doctor can actually name
-	if categoryRank[len(categoryRank)-1] != helpers.CategoryUnknown {
-		t.Errorf("expected %q to rank last, got %q",
-			helpers.CategoryUnknown, categoryRank[len(categoryRank)-1])
-	}
 }
 
-// The live wrong-bucket shape: CCCP reports unknown (the server closes the connection) while
-// HTTP names the real cause.  If unknown wins, the headline loses the only actionable fact.
+// The wrong-bucket shape: CCCP reports unknown while HTTP names the real cause
 func TestBootstrapSummaryPrefersANamedCauseOverUnknown(t *testing.T) {
 	attempts := []helpers.Attempt{
 		attempt("bootstrap-cccp", "node1:11210", helpers.PhaseSelectBucket, helpers.CategoryUnknown),
@@ -456,10 +429,7 @@ func TestBootstrapSummaryRanksAuthAboveEveryOtherNamedCause(t *testing.T) {
 	}
 }
 
-// Two bootstrap hosts can resolve to the same endpoint string (an LB, or a repeated host), so
-// markAttemptCategory matching on endpoint alone is only sound because the master is always the
-// FIRST config that succeeded.  Here the first config is usable and the second is not: prefer the
-// later one and the unusable config's category lands on the earlier, working record.
+// Endpoint-only matching is sound only because the master is the FIRST config that succeeded
 func TestMarkAttemptCategoryBlamesTheMastersOwnRecordOnADuplicateEndpoint(t *testing.T) {
 	defer saveGlobals()()
 
