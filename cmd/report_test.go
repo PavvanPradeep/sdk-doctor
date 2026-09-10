@@ -33,6 +33,7 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 		Finish(helpers.PhaseSelectBucket, "", nil), timing)
 
 	gLog.Warn("something looks off")
+	gLog.Error("something broke")
 
 	path := filepath.Join(t.TempDir(), "report.json")
 	if err := writeReport(path); err != nil {
@@ -81,6 +82,9 @@ func TestWriteReportCarriesTheCollectedResults(t *testing.T) {
 	}
 	if !warned {
 		t.Fatalf("expected the warning in the report log, got %+v", got.Log)
+	}
+	if got.Summary != (reportSummary{Warnings: 1, Errors: 1, Worst: "ERRO"}) {
+		t.Fatalf("unexpected report summary: %+v", got.Summary)
 	}
 }
 

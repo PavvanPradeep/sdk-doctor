@@ -9,11 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -554,7 +554,7 @@ func runDiagnose(cmd *cobra.Command, args []string) error {
 
 	var tlsConfig *tls.Config
 	if tlsCaArg != "" {
-		caCertData, err := ioutil.ReadFile(tlsCaArg)
+		caCertData, err := os.ReadFile(tlsCaArg)
 		if err != nil {
 			gLog.Error("Failed to read specified TLS certificate authority: %s", err)
 			return nil
@@ -883,33 +883,17 @@ func refuseRedirect(*http.Request, []*http.Request) error {
 const maxProbeBody = 256
 
 func boundedBody(body io.Reader) string {
-	data, _ := ioutil.ReadAll(io.LimitReader(body, maxProbeBody))
+	data, _ := io.ReadAll(io.LimitReader(body, maxProbeBody))
 
 	return strings.ToValidUTF8(strings.Join(strings.Fields(string(data)), " "), "")
 }
 
-func bodyClause(body string) string {
-	if body == "" {
+func clause(format, value string) string {
+	if value == "" {
 		return ""
 	}
 
-	return fmt.Sprintf(" (response: %s)", body)
-}
-
-func latencyClause(latency string) string {
-	if latency == "" {
-		return ""
-	}
-
-	return fmt.Sprintf(" in %s", latency)
-}
-
-func redirectClause(destination string) string {
-	if destination == "" {
-		return ""
-	}
-
-	return fmt.Sprintf(" redirecting to `%s`", destination)
+	return fmt.Sprintf(format, value)
 }
 
 func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string, tlsConfig *tls.Config) (terseBucketConfig, helpers.Attempt, error) {
@@ -969,15 +953,20 @@ func fetchHTTPTerseBucketConfig(host string, port int, bucket, user, pass string
 		return terseBucketConfig{}, builder.Finish(helpers.PhaseResponse, category, statusErr), statusErr
 	}
 
-	configBytes, err := ioutil.ReadAll(resp.Body)
+	configBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return terseBucketConfig{}, builder.Finish(helpers.PhaseResponse, helpers.Classify(helpers.PhaseResponse, err), err), err
 	}
 
-	configBytes = bytes.Replace(configBytes, []byte("$HOST"), []byte(host), -1)
+	return finishTerseConfig(builder, host, port, configBytes)
+}
+
+// finishTerseConfig parses the shared terse-config body once both the HTTP and CCCP fetch paths have it
+func finishTerseConfig(builder *helpers.AttemptBuilder, host string, port int, configBytes []byte) (terseBucketConfig, helpers.Attempt, error) {
+	configBytes = bytes.ReplaceAll(configBytes, []byte("$HOST"), []byte(host))
 
 	var config terseBucketConfig
-	err = json.Unmarshal(configBytes, &config)
+	err := json.Unmarshal(configBytes, &config)
 	if err != nil {
 		return terseBucketConfig{}, builder.Finish(helpers.PhaseConfig, helpers.CategoryConfigInvalid, err), err
 	}
@@ -999,8 +988,7 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 	}
 	defer client.Close()
 
-	// GetConfig runs after the dial deadline is cleared and carries its own, so the attempt's
-	// reported budget must cover it or Elapsed can exceed a Timeout that never applied
+	// GetConfig carries its own deadline after the dial's clears; add its budget or Elapsed can exceed a Timeout that never applied
 	builder.AddBudget(helpers.OpTimeout)
 
 	configBytes, err := client.GetConfig()
@@ -1008,18 +996,7 @@ func fetchCccpTerseBucketConfig(host string, port int, bucket, user, pass string
 		return terseBucketConfig{}, builder.FromDial(err), err
 	}
 
-	configBytes = bytes.Replace(configBytes, []byte("$HOST"), []byte(host), -1)
-
-	var config terseBucketConfig
-	err = json.Unmarshal(configBytes, &config)
-	if err != nil {
-		return terseBucketConfig{}, builder.Finish(helpers.PhaseConfig, helpers.CategoryConfigInvalid, err), err
-	}
-
-	config.SourceHost = host
-	config.SourcePort = port
-
-	return config, builder.Finish(helpers.PhaseConfig, "", nil), nil
+	return finishTerseConfig(builder, host, port, configBytes)
 }
 
 type portDef struct {
@@ -1125,7 +1102,7 @@ func isDialFailure(err error) bool {
 	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
-// httpProbeUnreachable reports whether a failed HTTP service probe never reached the service at all; the client timeout cancels the whole request, so a host that drops packets fails with a context deadline rather than a dial error
+// httpProbeUnreachable reports whether a failed probe never reached the service (a dropped-packet host times out like a dial failure)
 func httpProbeUnreachable(err error, timing memd.ConnectTiming) bool {
 	return isDialFailure(err) || timing.TCPDone.IsZero()
 }
@@ -1638,9 +1615,16 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 	for i, target := range nodesList {
 		gLog.Log("  [%d] %s", i, target.Hostname)
 
+		serviceNames := make([]string, 0, len(target.Services))
+		for service := range target.Services {
+			serviceNames = append(serviceNames, service)
+		}
+		sort.Strings(serviceNames)
+
 		serviceStr := ""
-		serviceNum := 0
-		for service, port := range target.Services {
+		for serviceNum, service := range serviceNames {
+			port := target.Services[service]
+
 			if serviceStr != "" {
 				serviceStr += ", "
 			}
@@ -1651,8 +1635,6 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				gLog.Log("    %s", serviceStr)
 				serviceStr = ""
 			}
-
-			serviceNum++
 		}
 
 		if serviceStr != "" {
@@ -1936,7 +1918,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 			gLog.Error(
 				"%s service at `%s:%d` answered `%s` with HTTP %d%s.  The endpoint was reached,"+
 					" so this is the service's own answer rather than a network fault.",
-				svcName, node.Hostname, svcPort, path, resp.StatusCode, bodyClause(probe.Body))
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" (response: %s)", probe.Body))
 
 			return
 		}
@@ -1953,17 +1935,17 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 				"Successfully connected to %s service at `%s:%d` (HTTP %d%s).  No documented"+
 					" health endpoint exists for this service, so its reachability was tested"+
 					" but its application health was not.",
-				svcName, node.Hostname, svcPort, resp.StatusCode, latencyClause(probe.Latency))
+				svcName, node.Hostname, svcPort, resp.StatusCode, clause(" in %s", probe.Latency))
 		case probeHealthUntested:
 			gLog.Warn(
 				"%s service at `%s:%d` answered `%s` with HTTP %d%s rather than serving the"+
 					" documented health endpoint.  The service was reached, but its application"+
 					" health was not tested; an older server version or a proxy in front of the"+
 					" port would both produce this.",
-				svcName, node.Hostname, svcPort, path, resp.StatusCode, redirectClause(probe.Redirect))
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" redirecting to `%s`", probe.Redirect))
 		default:
 			gLog.Log("%s service at `%s:%d` reported healthy on `%s` (HTTP %d%s)",
-				svcName, node.Hostname, svcPort, path, resp.StatusCode, latencyClause(probe.Latency))
+				svcName, node.Hostname, svcPort, path, resp.StatusCode, clause(" in %s", probe.Latency))
 		}
 	}
 
@@ -2084,8 +2066,7 @@ func diagnose(connStr, username, password string, tlsConfig *tls.Config) {
 					node.Hostname, kvPort, kvMaxErrorStreak)
 			}
 
-			// Read before the possible early exit below, as a failing connection is exactly
-			// when retransmit/loss counts are most useful for explaining why
+			// Read before the early exit below: retransmit/loss counts matter most when the connection is failing
 			if counters, ok := client.TCPCounters(); ok {
 				gLog.Log(
 					"TCP counters for `%s:%d`: rtt %s, rttvar %s, cwnd %d, retransmits %d, lost %d",

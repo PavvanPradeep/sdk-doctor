@@ -147,13 +147,7 @@ func (client *MemdClient) auth(user, pass string) error {
 	}
 
 	// Build PLAIN auth data
-	userBuf := []byte(user)
-	passBuf := []byte(pass)
-	authData := make([]byte, 1+len(userBuf)+1+len(passBuf))
-	authData[0] = 0
-	copy(authData[1:], userBuf)
-	authData[1+len(userBuf)] = 0
-	copy(authData[1+len(userBuf)+1:], passBuf)
+	authData := []byte("\x00" + user + "\x00" + pass)
 
 	err = client.conn.WritePacket(&memd.Request{
 		Magic:  memd.ReqMagic,
@@ -170,9 +164,8 @@ func (client *MemdClient) auth(user, pass string) error {
 		return NewPhaseError(PhaseSASL, Classify(PhaseSASL, err), err)
 	}
 
-	// A failure here is an authentication failure whatever status carries it, so the status is
-	// not run through CategoryForMemdStatus: that maps the select-bucket meanings of KEY_ENOENT
-	// and EACCESS, which would report an auth failure as a bucket problem
+	// Not run through CategoryForMemdStatus: its KEY_ENOENT/EACCESS mapping is for select-bucket,
+	// and would misreport an auth failure as a bucket problem
 	if resp.Status != 0 {
 		if resp.Status == memd.StatusAuthError {
 			return NewPhaseError(PhaseSASL, CategoryAuthRejected, errors.New("invalid bucket name/password"))
@@ -210,8 +203,7 @@ func (client *MemdClient) selectBucket(bucket string) error {
 	return nil
 }
 
-// OpTimeout bounds a single operation, as a stalled peer would otherwise block the run forever.
-// Exported so a caller sealing an attempt after an operation can report the budget it really had.
+// OpTimeout bounds a single operation; exported so a caller can report the budget it used
 const OpTimeout = 2000 * time.Millisecond
 
 // GetConfig will fetch a config via CCCP

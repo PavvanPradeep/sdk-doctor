@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -42,9 +43,7 @@ func (l *Logger) Entries() []LogEntry {
 	return l.entries
 }
 
-// Writer returns the log's destination, so callers printing raw blocks stay in step
-//
-//	with the log and remain redirectable in tests
+// Writer exposes the log's destination for callers that print raw blocks outside Log/Warn/Error
 func (l *Logger) Writer() io.Writer {
 	return l.writer()
 }
@@ -107,10 +106,32 @@ func (l Logger) PrintSummary() {
 		fmt.Fprintf(out, "%s %s\n", color.RedString("[ERRO]"), line)
 	}
 
-	fmt.Fprintf(out, "\n")
-	if len(warns) > 0 || len(errors) > 0 {
-		fmt.Fprintf(out, "Found multiple issues, see listing above.\n")
-	} else {
-		fmt.Fprintf(out, "Nothing of importance to note!  Nice job!\n")
+	fmt.Fprintf(out, "\n%s\n", closingLine(len(warns), len(errors)))
+}
+
+func closingLine(warns, errors int) string {
+	if warns == 0 && errors == 0 {
+		return "Nothing of importance to note!  Nice job!"
 	}
+
+	var parts []string
+	if warns > 0 {
+		parts = append(parts, pluralCount(warns, "warning"))
+	}
+	if errors > 0 {
+		parts = append(parts, pluralCount(errors, "error"))
+	}
+
+	line := fmt.Sprintf("Found %s, see listing above.", strings.Join(parts, ", "))
+	if errors > 0 {
+		return color.RedString(line)
+	}
+	return color.YellowString(line)
+}
+
+func pluralCount(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

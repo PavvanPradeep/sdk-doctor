@@ -140,16 +140,22 @@ func TestIsConnRefused(t *testing.T) {
 	}
 }
 
+// A TLS-phase failure is a handshake problem unless it's specifically a certificate problem
 func TestClassifyDistinguishesHandshakeFromVerification(t *testing.T) {
-	// A TLS-phase failure that is not a certificate problem is a handshake problem
-	generic := &net.OpError{Op: "remote error", Err: errTestHandshake{}}
-
-	if got := Classify(PhaseTLS, generic); got != CategoryTLSHandshake {
-		t.Errorf("expected a handshake category for a non-x509 TLS error, got %q", got)
+	tests := []struct {
+		name string
+		err  error
+		want Category
+	}{
+		{"wrapped generic error", &net.OpError{Op: "remote error", Err: errTestHandshake{}}, CategoryTLSHandshake},
+		{"record header error", tls.RecordHeaderError{Msg: "not a handshake"}, CategoryTLSHandshake},
+		{"unknown authority", x509.UnknownAuthorityError{}, CategoryTLSVerify},
 	}
 
-	if got := Classify(PhaseTLS, x509.UnknownAuthorityError{}); got != CategoryTLSVerify {
-		t.Errorf("expected a verification category for an x509 error, got %q", got)
+	for _, test := range tests {
+		if got := Classify(PhaseTLS, test.err); got != test.want {
+			t.Errorf("%s: Classify(tls, %v) = %q, want %q", test.name, test.err, got, test.want)
+		}
 	}
 }
 
@@ -181,17 +187,6 @@ func TestClassifyTimeoutsAreNamedByPhase(t *testing.T) {
 	}
 }
 
-// A TLS error that is not a timeout must still be named by the handshake/trust split
-func TestClassifyKeepsTheTLSSplitForNonTimeoutErrors(t *testing.T) {
-	if got := Classify(PhaseTLS, tls.RecordHeaderError{Msg: "not a handshake"}); got != CategoryTLSHandshake {
-		t.Errorf("Classify(tls, record header) = %q, want %q", got, CategoryTLSHandshake)
-	}
-
-	if got := Classify(PhaseTLS, x509.UnknownAuthorityError{}); got != CategoryTLSVerify {
-		t.Errorf("Classify(tls, unknown authority) = %q, want %q", got, CategoryTLSVerify)
-	}
-}
-
 type errTestTimeout struct{}
 
 func (errTestTimeout) Error() string   { return "i/o timeout" }
@@ -208,9 +203,7 @@ func TestCategoryForConfigStatusKeepsMeaningfulStatuses(t *testing.T) {
 		{memd.StatusNotSupported, CategoryCCCPUnsupported},
 		{memd.StatusAccessError, CategoryBucketForbidden},
 		{memd.StatusAuthError, CategoryAuthRejected},
-		// select_bucket has already succeeded for this bucket by the time a config is fetched,
-		// so KEY_ENOENT here cannot mean the bucket is missing: no configuration came back at
-		// all, which is a different fault from one that came back describing no nodes
+		// bucket is already selected here, so KEY_ENOENT means no config came back, not a missing bucket
 		{memd.StatusKeyNotFound, CategoryConfigUnavailable},
 	}
 

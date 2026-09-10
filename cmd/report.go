@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"os"
 	"time"
 
 	"github.com/couchbaselabs/sdk-doctor/helpers"
@@ -59,6 +59,12 @@ type tcpCountersResult struct {
 // reportSchemaVersion is bumped whenever a field's meaning changes, so a consumer can tell
 const reportSchemaVersion = 1
 
+type reportSummary struct {
+	Warnings int
+	Errors   int
+	Worst    string `json:",omitempty"`
+}
+
 type diagnosticReport struct {
 	SchemaVersion    int
 	StartedAt        time.Time
@@ -77,21 +83,43 @@ type diagnosticReport struct {
 	IdleTest         []idleTestResult    `json:",omitempty"`
 	TCPCounters      []tcpCountersResult `json:",omitempty"`
 	Log              []helpers.LogEntry
+	Summary          reportSummary
 }
 
 var gReport diagnosticReport
+
+func summarizeLog(entries []helpers.LogEntry) reportSummary {
+	var s reportSummary
+
+	for _, entry := range entries {
+		switch entry.Level {
+		case "WARN":
+			s.Warnings++
+		case "ERRO":
+			s.Errors++
+		}
+	}
+	if s.Errors > 0 {
+		s.Worst = "ERRO"
+	} else if s.Warnings > 0 {
+		s.Worst = "WARN"
+	}
+
+	return s
+}
 
 func writeReport(path string) error {
 	gReport.SchemaVersion = reportSchemaVersion
 	gReport.FinishedAt = time.Now()
 	gReport.Log = gLog.Entries()
+	gReport.Summary = summarizeLog(gReport.Log)
 
 	data, err := json.MarshalIndent(gReport, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return ioutil.WriteFile(path, append(data, '\n'), 0644)
+	return os.WriteFile(path, append(data, '\n'), 0644)
 }
 
 func durs(samples []time.Duration) []string {

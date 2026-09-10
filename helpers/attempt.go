@@ -166,8 +166,7 @@ func Classify(phase Phase, err error) Category {
 		}
 	}
 
-	// Checked before the TLS split, so a handshake that stalls is reported as a stall rather
-	// than as two ends that could not agree
+	// Checked before the TLS split so a stalled handshake reads as a stall, not a failed negotiation
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		switch phase {
@@ -256,9 +255,7 @@ func CategoryForMemdStatus(status memd.StatusCode) Category {
 
 // CategoryForConfigStatus maps a failed config fetch, preferring a named cause over "unsupported"
 func CategoryForConfigStatus(status memd.StatusCode) Category {
-	// The bucket is already established on this connection by the time a config is fetched, so
-	// KEY_ENOENT here means no configuration came back, not that the bucket is missing.  That
-	// is a distinct fault from a configuration that did come back and described no nodes.
+	// Bucket is already selected here, so KEY_ENOENT means no config came back, not a missing bucket
 	if status == memd.StatusKeyNotFound {
 		return CategoryConfigUnavailable
 	}

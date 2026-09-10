@@ -291,28 +291,6 @@ func TestDialTagsTheAttemptWithItsKindParameter(t *testing.T) {
 }
 
 // A failed dial must still yield a Phase and Category, not a zero value worth nothing to record
-func TestDialFailureProducesARecordableAttempt(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to reserve a port: %s", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-
-	_, builder, err := Dial("perf-kv", "127.0.0.1", port, "travel", "Administrator", "password", nil)
-	if err == nil {
-		t.Fatal("expected the dial to fail against a closed port")
-	}
-
-	attempt := builder.FromDial(err)
-	if attempt.Phase == "" {
-		t.Errorf("expected a non-empty phase on a failed dial, got %+v", attempt)
-	}
-	if attempt.Category == "" {
-		t.Errorf("expected a non-empty category on a failed dial, got %+v", attempt)
-	}
-}
-
 func TestDialRecordsAFailedConnectAsAnAttempt(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
