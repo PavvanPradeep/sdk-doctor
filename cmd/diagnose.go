@@ -1005,13 +1005,6 @@ type portDef struct {
 	Name string
 }
 
-var couchbasePorts = []portDef{
-	{8091, "mgmt"}, {8092, "views"}, {8093, "query"}, {8094, "search"},
-	{8095, "analytics"}, {8096, "eventing"}, {8097, "backup"}, {11210, "kv"},
-	{18091, "mgmtSSL"}, {18092, "viewsSSL"}, {18093, "querySSL"}, {18094, "searchSSL"},
-	{18095, "analyticsSSL"}, {18096, "eventingSSL"}, {18097, "backupSSL"}, {11207, "kvSSL"},
-}
-
 // Services an SDK connects to; a cluster also advertises node-internal ports no client ever uses
 var sdkServices = map[string]bool{
 	"kv": true, "mgmt": true, "capi": true, "n1ql": true, "fts": true, "cbas": true,
@@ -1048,9 +1041,6 @@ func countAdvertisingNodes(nodes []clusterNode, port int, useTLS bool) int {
 
 func matrixPorts(nodes []clusterNode, useTLS bool) []portDef {
 	names := map[int]string{}
-	for _, p := range couchbasePorts {
-		names[p.Port] = p.Name
-	}
 
 	for _, node := range nodes {
 		for name, port := range node.Services {
